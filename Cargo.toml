@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/tg-domain",
+    "crates/tg-git-engine",
+    "crates/tg-auth",
+    "crates/tg-providers",
+    "apps/desktop/src-tauri",
+]
+
+[workspace.package]
+version = "1.0.0"
+edition = "2021"
+rust-version = "1.88"
+license = "MIT"
+repository = "https://github.com/Rynos-PCP/Terra-Git"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tracing = "0.1"
+# Local git operations in-process; remote ops run through the system-git sidecar,
+# so no ssh/https features are needed (avoids OpenSSL/libssh2 build dependencies).
+git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
+# Provider APIs: a lean reqwest client instead of the octocrab/gitlab crates (a
+# deliberate deviation: only a few REST endpoints are needed, and
+# it saves two large dependencies; rustls + the system truststore covers enterprise CAs).
+#
+# DELIBERATELY on 0.12: Cargo.lock additionally contains reqwest 0.13 (from
+# tauri), but that is NOT a duplicate tree in the desktop build — tauri declares
+# reqwest only target-specifically for Android/iOS (tauri/Cargo.toml:
+# cfg(any(target_os = "android", all(target_vendor = "apple", not(target_os =
+# "macos"))))). On Windows/macOS/Linux it is never built; `cargo tree -i reqwest`
+# shows only tg-providers there. A bump to 0.13 would deduplicate nothing, but
+# its "rustls" feature pulls in aws-lc-rs/aws-lc-sys instead of ring and with it
+# cmake (plus NASM on Windows) as a new build toolchain requirement.
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls-native-roots", "json"] }
+# OS keychain (Windows Credential Manager / macOS Keychain / Secret Service).
+keyring = { version = "3", features = ["windows-native", "apple-native", "sync-secret-service"] }
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
+tokio = { version = "1", features = ["rt", "macros"] }
+tg-domain = { path = "crates/tg-domain" }
+tg-git-engine = { path = "crates/tg-git-engine" }
+tg-auth = { path = "crates/tg-auth" }
+tg-providers = { path = "crates/tg-providers" }
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

@@ -1,0 +1,32 @@
+# cargo-about — generates the third-party license notices for the bundle.
+# Generate with: `cargo about generate about.hbs > THIRD-PARTY-NOTICES.txt`.
+#
+# This covers the RUST dependency graph only. The installer also ships the built
+# frontend, so the npm half is appended separately by
+# `node scripts/gen-npm-notices.mjs` — see CONTRIBUTING.md.
+
+# Allowed licenses (kept in sync with deny.toml). libgit2-sys: GPL-2.0 with a
+# linking exception.
+accepted = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+    "GPL-2.0",
+]
+
+# Only consider the desktop app that is actually shipped.
+targets = [
+    "x86_64-pc-windows-msvc",
+    "x86_64-apple-darwin",
+    "aarch64-apple-darwin",
+    "x86_64-unknown-linux-gnu",
+]

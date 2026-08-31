@@ -1,0 +1,26 @@
+[package]
+name = "tg-git-engine"
+description = "terra-git: Git engine (git2 for local ops, system-git sidecar for remote ops)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+tg-domain = { workspace = true }
+git2 = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+base64 = "0.23"
+# Trash instead of a hard rm when removing SSH keys (recoverable).
+trash = "5"
+
+[dev-dependencies]
+criterion = { version = "0.8.2", default-features = false }
+tempfile = "3"
+
+[[bench]]
+name = "read_path"
+harness = false

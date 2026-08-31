@@ -1,0 +1,12 @@
+[package]
+name = "tg-domain"
+description = "terra-git: shared domain types (repo, status, commit, diff)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+serde = { workspace = true }

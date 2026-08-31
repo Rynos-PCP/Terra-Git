@@ -1,0 +1,32 @@
+# Code owners for terra-git.
+#
+# GitHub auto-requests a review from the owner of every touched path, and the
+# "Require review from Code Owners" branch rule builds on this file. The
+# security-sensitive paths are listed explicitly, even though the default owner
+# already covers them: it makes the intent visible to contributors, and it keeps
+# the review request in place if the default line is ever narrowed.
+#
+# Order matters — the LAST matching pattern wins.
+
+# Default owner for everything.
+*                                                 @Rynos-PCP
+
+# --- Security-sensitive paths (see SECURITY.md, "Areas that matter most") ----
+# Credential bridge: tokens live in the OS keychain and must not reach files,
+# logs or process arguments.
+/apps/desktop/src-tauri/src/credential_helper.rs  @Rynos-PCP
+/crates/tg-auth/                                  @Rynos-PCP
+# git sidecar: every argument list has to stay injection-proof.
+/crates/tg-git-engine/src/sidecar.rs              @Rynos-PCP
+# Tauri edge: command surface, deny-by-default capabilities, CSP.
+/apps/desktop/src-tauri/src/commands.rs           @Rynos-PCP
+/apps/desktop/src-tauri/capabilities/             @Rynos-PCP
+/apps/desktop/src-tauri/tauri.conf.json           @Rynos-PCP
+# Provider clients: TLS verification may only be relaxed per host, explicitly.
+/crates/tg-providers/                             @Rynos-PCP
+
+# --- Build, CI and supply chain ---------------------------------------------
+/.github/                                         @Rynos-PCP
+/deny.toml                                        @Rynos-PCP
+/Cargo.lock                                       @Rynos-PCP
+/apps/desktop/package-lock.json                   @Rynos-PCP

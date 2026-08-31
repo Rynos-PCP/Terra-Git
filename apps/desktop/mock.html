@@ -1,0 +1,346 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>terra-git (Mock)</title>
+    <script>
+      // Set the theme IMMEDIATELY (before the first frame): otherwise headless
+      // Edge paints the first frame with the dark default and freezes layers
+      // (e.g. the toolbar) from it into the screenshot.
+      (function () {
+        var th = new URLSearchParams(location.search).get("theme");
+        if (th === "light" || th === "dark") document.documentElement.dataset.theme = th;
+      })();
+      // Tauri IPC stub BEFORE all module imports: supplies demo data for the
+      // headless UI smoke test (no real backend needed).
+      window.__TAURI_INTERNALS__ = {
+        transformCallback: function () {
+          return Math.floor(Math.random() * 1e9);
+        },
+        invoke: function (cmd) {
+          var scene = new URLSearchParams(location.search).get("scene");
+          // Scene "conflictError": for conflict candidates showError refreshes
+          // the status silently (state.svelte.ts) — without this stub the answer
+          // would empty the scene and the workshop offer would never appear.
+          if (scene === "conflictError" && cmd === "get_status") {
+            return Promise.resolve({
+              staged: [],
+              unstaged: [
+                { path: "src/lib/api.ts", origPath: null, kind: "conflicted" },
+                { path: "README.md", origPath: null, kind: "conflicted" },
+              ],
+              branch: "main",
+              upstream: "origin/main",
+              ahead: 0,
+              behind: 1,
+              opState: "merge",
+            });
+          }
+          // Scene "unchanged": a file that counts as changed but has no content
+          // diff — empty hunks plus the engine's explanation.
+          if (scene === "unchanged") {
+            if (cmd === "get_file_diff") {
+              return Promise.resolve({
+                path: "apps/desktop/src-tauri/Cargo.toml",
+                oldPath: null,
+                isBinary: false,
+                hunks: [],
+                truncated: false,
+                oldSize: 18,
+                newSize: 15,
+              });
+            }
+            if (cmd === "explain_unchanged") {
+              // The case actually observed: the content is byte-equal, only the
+              // line endings differ from what a checkout would write.
+              // oldEol stays empty — both sides are the same content, so a
+              // side-by-side comparison would inevitably be identical (that is
+              // what the engine returns too).
+              return Promise.resolve({
+                reason: "eolOnly",
+                oldEol: null,
+                newEol: "lf",
+                expectedEol: "crlf",
+                oldMode: null,
+                newMode: null,
+              });
+            }
+          }
+          var data = {
+            list_backups: [
+              {
+                name: "refs/terra-git/backup/squash-1783600000",
+                op: "squash",
+                timestamp: Math.floor(Date.now() / 1000) - 3600,
+                targetId: "abcdef1234567890abcdef1234567890abcdef12",
+                subject: "Third commit",
+              },
+              {
+                name: "refs/terra-git/backup/rebase-interactive-1783500000",
+                op: "rebase-interactive",
+                timestamp: Math.floor(Date.now() / 1000) - 90000,
+                targetId: "1234567890abcdef1234567890abcdef12345678",
+                subject: "Feature finished",
+              },
+            ],
+            list_remotes: [
+              { name: "origin", url: "https://github.com/demo/terra-git.git" },
+              { name: "gitlab", url: "https://gitlab.local/demo/terra-git.git" },
+            ],
+            provider_default_branch: "main",
+            sparse_status: {
+              enabled: true,
+              patterns: ["apps", "crates"],
+              topDirs: ["apps", "crates", "docs", ".github"],
+            },
+            provider_accounts: [
+              { host: "gitlab.local", kind: "gitlab", username: "demo", insecureTls: true },
+            ],
+            pipeline_detect: {
+              provider: "gitlab",
+              configFile: ".gitlab-ci.yml",
+              runnersInstalled: { gitlab: true, github: false },
+              dockerRunning: false,
+              missingTools: ["rsync"],
+            },
+            pipeline_configs: [{ path: ".gitlab-ci.yml", provider: "gitlab" }],
+            pipeline_graph: {
+              provider: "gitlab",
+              configFile: ".gitlab-ci.yml",
+              stages: ["build", "test", "deploy"],
+              jobs: [
+                { name: "compile", stage: "build", needs: [], when: "on_success", allowFailure: false },
+                { name: "unit", stage: "test", needs: ["compile"], when: "on_success", allowFailure: false },
+                { name: "lint", stage: "test", needs: [], when: "on_success", allowFailure: true },
+                { name: "release", stage: "deploy", needs: ["unit"], when: "manual", allowFailure: false },
+              ],
+            },
+            pipeline_run_scope: 0,
+            list_change_requests: {
+              host: "gitlab.local",
+              repoPath: "demo/terra-git",
+              kind: "gitlab",
+              items: [
+                {
+                  number: 42,
+                  title: "feat: command palette with fuzzy search",
+                  author: "lena",
+                  sourceBranch: "feature/palette",
+                  targetBranch: "main",
+                  isDraft: false,
+                  webUrl: "https://gitlab.local/demo/terra-git/-/merge_requests/42",
+                  updatedAt: Math.floor(Date.now() / 1000) - 1800,
+                  ciStatus: "success",
+                },
+                {
+                  number: 41,
+                  title: "fix(diff): CRLF detection for partial patches",
+                  author: "marek",
+                  sourceBranch: "fix/crlf",
+                  targetBranch: "main",
+                  isDraft: true,
+                  webUrl: "https://gitlab.local/demo/terra-git/-/merge_requests/41",
+                  updatedAt: Math.floor(Date.now() / 1000) - 86400,
+                  ciStatus: "failed",
+                },
+                {
+                  number: 40,
+                  title: "chore: warm up the CI cache",
+                  author: "sarah",
+                  sourceBranch: "chore/ci-cache",
+                  targetBranch: "develop",
+                  isDraft: false,
+                  webUrl: "https://gitlab.local/demo/terra-git/-/merge_requests/40",
+                  updatedAt: Math.floor(Date.now() / 1000) - 300,
+                  ciStatus: "running",
+                },
+              ],
+            },
+            unpushed_commits: [
+              {
+                id: "9f3c2e1a7b6d5c4e3f2a1b0c9d8e7f6a5b4c3d2e",
+                subject: "feat(diff): name the cause instead of “No changes”",
+                body: "Detects EOL-only and mode-only cases and shows them in the diff header.\n\nCo-authored-by: Lena Falk <lena@example.com>",
+                authorName: "Demo User",
+                authorEmail: "dev@example.com",
+                time: Math.floor(Date.now() / 1000) - 2700,
+                parentIds: ["8e2b1d0c9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d"],
+                isHead: true,
+                isMerge: false,
+              },
+              {
+                id: "8e2b1d0c9a8b7c6d5e4f3a2b1c0d9e8f7a6b5c4d",
+                subject: "fix(ui): hover highlight of the recents rows",
+                body: "",
+                authorName: "Demo User",
+                authorEmail: "dev@example.com",
+                time: Math.floor(Date.now() / 1000) - 18000,
+                parentIds: ["7d1a0c9b8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d"],
+                isHead: false,
+                isMerge: false,
+              },
+              {
+                id: "7d1a0c9b8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d",
+                subject: "wip: debug output",
+                body: "Temporary console.log calls.",
+                authorName: "Demo User",
+                authorEmail: "dev@example.com",
+                time: Math.floor(Date.now() / 1000) - 100000,
+                parentIds: ["6c0a9b8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e"],
+                isHead: false,
+                isMerge: false,
+              },
+              {
+                id: "6c0a9b8a7b6c5d4e3f2a1b0c9d8e7f6a5b4c3d2e",
+                subject: "chore: update Cargo.lock",
+                body: "",
+                authorName: "Demo User",
+                authorEmail: "dev@example.com",
+                time: Math.floor(Date.now() / 1000) - 260000,
+                parentIds: ["5b9a8b7a6b5c4d3e2f1a0b9c8d7e6f5a4b3c2d1e"],
+                isHead: false,
+                isMerge: false,
+              },
+            ],
+            get_log: [],
+            get_log_all: [],
+            list_stashes: [],
+            list_tags: [],
+            // Line balances for the changes overview.
+            status_numstat: [
+              { path: "src/lib/api.ts", added: 45, deleted: 0, binary: false },
+              { path: "README.md", added: 12, deleted: 3, binary: false },
+              { path: "src/lib/state.svelte.ts", added: 8, deleted: 2, binary: false },
+              { path: "src/lib/components/Toolbar.svelte", added: 30, deleted: 11, binary: false },
+              { path: "docs/HANDBOOK.md", added: 26, deleted: 0, binary: false },
+              { path: "new.txt", added: 7, deleted: 0, binary: false },
+            ],
+            get_recent_repos: [
+              {
+                path: "C:\\demo\\terra-git",
+                lastOpened: Math.floor(Date.now() / 1000) - 7200,
+                pinned: true,
+              },
+              {
+                path: "C:\\demo\\projects\\website",
+                lastOpened: Math.floor(Date.now() / 1000) - 90000,
+                pinned: false,
+              },
+              {
+                path: "C:\\demo\\dotfiles",
+                lastOpened: Math.floor(Date.now() / 1000) - 260000,
+                pinned: false,
+              },
+            ],
+            // Short portrait for the welcome screen: the same for all demo repos
+            // (the stub knows no arguments) — two branch strands and a tag so the
+            // vein sketch shows everything.
+            peek_repo: {
+              branch: "main",
+              dirty: true,
+              commits: [
+                { time: Math.floor(Date.now() / 1000) - 2700, isMerge: false, hasTag: false },
+                { time: Math.floor(Date.now() / 1000) - 18000, isMerge: false, hasTag: true },
+                { time: Math.floor(Date.now() / 1000) - 100000, isMerge: true, hasTag: false },
+                { time: Math.floor(Date.now() / 1000) - 260000, isMerge: false, hasTag: false },
+                { time: Math.floor(Date.now() / 1000) - 400000, isMerge: false, hasTag: false },
+                { time: Math.floor(Date.now() / 1000) - 500000, isMerge: false, hasTag: false },
+              ],
+              branches: [
+                {
+                  name: "feature/palette",
+                  baseIndex: 2,
+                  ahead: 3,
+                  tipTime: Math.floor(Date.now() / 1000) - 9000,
+                },
+                {
+                  name: "fix/crlf",
+                  baseIndex: null,
+                  ahead: 1,
+                  tipTime: Math.floor(Date.now() / 1000) - 300000,
+                },
+                // Ancestor branch (merged, ahead 0): appears as a ring at the tip
+                // commit instead of as a strand of its own.
+                {
+                  name: "release/0.3",
+                  baseIndex: 3,
+                  ahead: 0,
+                  tipTime: Math.floor(Date.now() / 1000) - 260000,
+                },
+              ],
+            },
+            "plugin:app|version": "1.0.0",
+            // Conflict workshop: a running merge (scene "conflicts").
+            get_op_context: {
+              kind: "merge",
+              oursLabel: "main",
+              theirsLabel: "feature/palette",
+              theirsSummary: "feat(palette): improve fuzzy search",
+              step: null,
+              total: null,
+            },
+            read_conflict: {
+              file: "src/lib/api.ts",
+              eol: "lf",
+              hasConflicts: true,
+              segments: [
+                {
+                  kind: "context",
+                  lines: ["export interface CommandError {", "  code: string;"],
+                  ours: [],
+                  theirs: [],
+                  base: null,
+                },
+                {
+                  kind: "conflict",
+                  lines: [],
+                  ours: ["  message: string;", "  details: string | null;"],
+                  theirs: ["  message: string;", "  hint?: string;"],
+                  base: ["  message: string;"],
+                },
+                {
+                  kind: "context",
+                  lines: ["}", "", "function toCommandError(e: unknown) {"],
+                  ours: [],
+                  theirs: [],
+                  base: null,
+                },
+                {
+                  kind: "conflict",
+                  lines: [],
+                  ours: ["  return normalize(e);"],
+                  theirs: ["  return normalizeError(e);"],
+                  base: null,
+                },
+                {
+                  kind: "context",
+                  lines: ["}"],
+                  ours: [],
+                  theirs: [],
+                  base: null,
+                },
+              ],
+            },
+          };
+          // peek_repo answers DELAYED like the real backend: the vein has to
+          // start its build-up animation when the data ARRIVES, not only on a
+          // repo switch (a regression from 6.8.4 item 1 — the instantly
+          // answering stub had hidden the timing hole).
+          if (cmd === "peek_repo") {
+            return new Promise(function (res) {
+              setTimeout(function () {
+                res(data.peek_repo);
+              }, 350);
+            });
+          }
+          return Promise.resolve(cmd in data ? data[cmd] : null);
+        },
+      };
+    </script>
+  </head>
+  <body>
+    <div id="app"></div>
+    <script type="module" src="/src/main-mock.ts"></script>
+  </body>
+</html>

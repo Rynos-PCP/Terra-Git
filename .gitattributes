@@ -1,0 +1,4 @@
+# Normalize line endings: text files always live in the repo with LF.
+# Prevents the well-known EOL trap (a CRLF worktree vs. LF blobs -> whole-file
+# diffs, stash/merge conflicts, blame showing "Not Committed Yet").
+* text=auto

@@ -1,0 +1,40 @@
+[package]
+name = "tg-app"
+description = "terra-git desktop app (Tauri 2, Rust core)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[features]
+# Production feature (the standard Tauri scaffold, do NOT remove): loads the
+# embedded frontend (frontendDist) instead of the devUrl. `tauri build` enables
+# it automatically. A bare `cargo build --release` WITHOUT this feature produces
+# an exe that only shows ERR_CONNECTION_REFUSED — runnable release builds
+# therefore go through `npm run tauri build` or
+# `cargo build --release -p tg-app --features custom-protocol`.
+# Deliberately NO default feature: `tauri dev` needs the devUrl (hot reload).
+custom-protocol = ["tauri/custom-protocol"]
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-dialog = "2"
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-appender = "0.2"
+tg-domain = { workspace = true }
+tg-git-engine = { workspace = true }
+tg-auth = { workspace = true }
+tg-providers = { workspace = true }
+notify = "8.2.0"
+trash = "5"
+
+[dev-dependencies]
+tempfile = "3"

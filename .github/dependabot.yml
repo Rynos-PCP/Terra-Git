@@ -1,0 +1,49 @@
+# Automatic dependency updates.
+#
+# Three ecosystems, three roots: the Cargo workspace sits at the repo root, the
+# frontend under apps/desktop, the actions in .github/workflows.
+#
+# Weekly instead of daily: a daily flood of PRs is the reliable way to stop
+# reading updates altogether. Patch updates are grouped so the list stays
+# short; major updates come individually, because they deserve to be reviewed
+# individually.
+
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      rust-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: npm
+    directory: "/apps/desktop"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      npm-patch:
+        update-types: ["minor", "patch"]
+
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: monthly
+    open-pull-requests-limit: 3
+    labels: ["dependencies"]
+    commit-message:
+      prefix: "chore(ci)"
+    groups:
+      actions:
+        update-types: ["minor", "patch"]

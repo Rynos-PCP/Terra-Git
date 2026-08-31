@@ -1,0 +1,21 @@
+Third-party licenses — terra-git
+==================================
+
+This product includes third-party software under the following licenses.
+Three parts: the Rust dependencies below, generated with
+`cargo about generate about.hbs`; the npm packages compiled into the shipped
+frontend, generated with `node scripts/gen-npm-notices.mjs`; and the C libraries
+compiled in from vendored sources, generated with
+`node scripts/gen-vendored-notices.mjs`.
+See CONTRIBUTING.md for the full regeneration command.
+
+{{#each licenses}}
+--------------------------------------------------------------------------------
+{{{name}}} ({{id}})
+
+Used by:
+{{#each used_by}}  - {{crate.name}} {{crate.version}}
+{{/each}}
+{{{text}}}
+
+{{/each}}

@@ -1,0 +1,181 @@
+/* ============================================================
+   terra-git design tokens — "slate & verdigris"
+   The global source for ALL colours, spacings, radii, typography and
+   shadows. Components never hard-code a colour — only through these
+   tokens. Light/dark via data-theme on <html>.
+
+   Basis: cool slate neutrals (dark) / marble (light), a verdigris
+   accent. Red/green/ochre stay reserved for the diff semantics.
+   Contrast: text colours >= 4.5:1 on their default backgrounds
+   (WCAG AA), verified numerically.
+   ============================================================ */
+
+:root {
+  /* Spacing (4px grid) & radii */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 24px;
+  --space-6: 32px;
+  --radius-sm: 4px;
+  --radius: 6px;
+  --radius-lg: 8px;
+  --radius-xl: 12px;
+
+  /* Typography (the CSP forbids web fonts — system faces) */
+  --sans: "Segoe UI Variable Text", "Segoe UI", Inter, system-ui, sans-serif;
+  --display: "Segoe UI Variable Display", "Segoe UI", Inter, system-ui, sans-serif;
+  --mono: "Cascadia Code", Consolas, "JetBrains Mono", "SF Mono", monospace;
+}
+
+/* ---------- Dark theme (default): slate ---------- */
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
+
+  --bg-app: #111518;
+  --bg-panel: #161b1f;
+  --bg-inset: #0c0f12;
+  --bg-elevated: #1e242a;
+  --bg-hover: #272f36;
+  --bg-selected: #1c332c;
+  --border: #293138;
+  --border-strong: #404c56;
+
+  --text-primary: #e8edf0;
+  --text-muted: #9dabb4;
+  /* >= 4.5:1 against --bg-panel and --bg-inset (placeholder, line numbers, blame time) */
+  --text-faint: #86959f;
+
+  --accent: #3ecda6;
+  --accent-dim: #1d9377;
+  --accent-text: #071310;
+  --focus-ring: rgba(62, 205, 166, 0.45);
+
+  --blue: #5da2e8;
+  --added: #45bc59;
+  --modified: #d59b35;
+  --deleted: #f25b4d;
+  --renamed: #5da2e8;
+  /* Ref decorations in the history (tag chips): their own ochre, deliberately
+     NOT a diff semantic token. */
+  --ref-tag: #c8a24e;
+  --conflicted: #fb7a6c;
+  /* Warning tone (orphaned branches etc.), >= 4.5:1 on --bg-panel. */
+  --warn: #d59b35;
+
+  --add-bg: rgba(69, 188, 89, 0.13);
+  --add-bg-strong: rgba(69, 188, 89, 0.34);
+  --del-bg: rgba(242, 91, 77, 0.13);
+  --del-bg-strong: rgba(242, 91, 77, 0.34);
+  --hunk-bg: rgba(93, 162, 232, 0.08);
+
+  --graph-1: #3ecda6;
+  --graph-2: #64a7ef;
+  --graph-3: #c79df1;
+  --graph-4: #dfa440;
+  --graph-5: #ee7fae;
+  --graph-6: #85c96b;
+  --graph-7: #55c4c7;
+  --graph-8: #eb8a5e;
+
+  /* Strata (the welcome signature): slate layers from top to bottom */
+  --strata-0: #202930;
+  --strata-1: #1c242a;
+  --strata-2: #181f25;
+  --strata-3: #141a1f;
+  --strata-4: #10161a;
+  --strata-5: #0c1115;
+  --strata-vein: rgba(62, 205, 166, 0.55);
+
+  /* Subtle top edge for controls. As a token so button.ghost & co. can
+     override the default despite the theme selector. */
+  --btn-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.04);
+  --shadow-menu: 0 8px 28px rgba(2, 6, 9, 0.4), 0 2px 8px rgba(2, 6, 9, 0.3);
+  --shadow-modal: 0 24px 64px rgba(2, 6, 9, 0.5), 0 4px 16px rgba(2, 6, 9, 0.35);
+  /* Dimming behind modals */
+  --overlay: rgba(6, 10, 13, 0.45);
+}
+
+/* ---------- Light theme: marble ---------- */
+:root[data-theme="light"] {
+  color-scheme: light;
+
+  --bg-app: #eef1f2;
+  --bg-panel: #ffffff;
+  --bg-inset: #e4e9eb;
+  --bg-elevated: #f5f7f8;
+  --bg-hover: #e6ebed;
+  --bg-selected: #d9efe6;
+  --border: #d6dde0;
+  --border-strong: #a2b0b7;
+
+  --text-primary: #1a2126;
+  --text-muted: #52626b;
+  /* >= 4.5:1 against a white panel and --bg-inset */
+  --text-faint: #5b6a74;
+
+  --accent: #0d7c63;
+  --accent-dim: #0b6752;
+  --accent-text: #ffffff;
+  --focus-ring: rgba(13, 124, 99, 0.35);
+
+  --blue: #0b69c7;
+  --added: #1a7f37;
+  --modified: #96660a;
+  --deleted: #cf2f27;
+  --renamed: #0b69c7;
+  --ref-tag: #7d641a;
+  --conflicted: #cf2f27;
+  /* Warning tone (orphaned branches etc.), >= 4.5:1 on a white panel. */
+  --warn: #96660a;
+
+  --add-bg: rgba(26, 127, 55, 0.11);
+  --add-bg-strong: rgba(26, 127, 55, 0.3);
+  --del-bg: rgba(207, 47, 39, 0.09);
+  --del-bg-strong: rgba(207, 47, 39, 0.26);
+  --hunk-bg: rgba(11, 105, 199, 0.06);
+
+  --graph-1: #0d7c63;
+  --graph-2: #0b69c7;
+  --graph-3: #7a4bd6;
+  --graph-4: #9c6408;
+  --graph-5: #bb3a7d;
+  --graph-6: #3f7d1e;
+  --graph-7: #0e7f86;
+  --graph-8: #b3541e;
+
+  --strata-0: #eaeef0;
+  --strata-1: #e2e8ea;
+  --strata-2: #d9e0e3;
+  --strata-3: #cfd8db;
+  --strata-4: #c5cfd3;
+  --strata-5: #bac6cb;
+  --strata-vein: rgba(13, 124, 99, 0.5);
+
+  --btn-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.6), 0 1px 2px rgba(28, 38, 45, 0.05);
+  --shadow-menu: 0 8px 24px rgba(28, 38, 45, 0.16), 0 1px 4px rgba(28, 38, 45, 0.1);
+  --shadow-modal: 0 24px 64px rgba(28, 38, 45, 0.22), 0 4px 16px rgba(28, 38, 45, 0.12);
+  --overlay: rgba(20, 28, 33, 0.32);
+}
+
+/* ---------- Increased contrast (accessibility) ----------
+   Strengthens borders and secondary text; status colours stay unchanged so
+   the meaning coding (added/modified/deleted) is preserved. */
+:root[data-contrast="high"],
+:root[data-theme="dark"][data-contrast="high"] {
+  --text-muted: #c2cdd4;
+  --text-faint: #aebac2;
+  --border: #46545e;
+  --border-strong: #667986;
+  --focus-ring: rgba(62, 205, 166, 0.7);
+}
+
+:root[data-theme="light"][data-contrast="high"] {
+  --text-muted: #39474f;
+  --text-faint: #41505a;
+  --border: #9fadb4;
+  --border-strong: #5e707a;
+  --focus-ring: rgba(13, 124, 99, 0.55);
+}

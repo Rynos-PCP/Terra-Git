@@ -1,0 +1,62 @@
+# cargo-deny — supply chain gate: advisories, licenses, sources.
+# Locally/CI: `cargo deny check`.
+
+[advisories]
+# RUSTSEC advisory DB. Known, deliberately accepted advisories in `ignore`
+# (triaged 2026-07-15). Exclusively transitive items without an available fix —
+# re-evaluate regularly. The git2 entries were dropped with git2 0.21; the
+# remaining ones wait on Tauri's GTK4 migration.
+yanked = "warn"
+ignore = [
+    # gtk-rs GTK3 bindings "unmaintained" — comes in through Tauri 2 / WebKitGTK
+    # (Linux only). No fix until Tauri's GTK4 migration; not a vulnerability.
+    "RUSTSEC-2024-0411",
+    "RUSTSEC-2024-0412",
+    "RUSTSEC-2024-0413",
+    "RUSTSEC-2024-0414",
+    "RUSTSEC-2024-0415",
+    "RUSTSEC-2024-0416",
+    "RUSTSEC-2024-0417",
+    "RUSTSEC-2024-0418",
+    "RUSTSEC-2024-0419",
+    "RUSTSEC-2024-0420",
+    # proc-macro-error "unmaintained" — a transitive macro dependency.
+    "RUSTSEC-2024-0370",
+    # unic-* "unmaintained" — transitive (Unicode/idna). Not a vulnerability.
+    "RUSTSEC-2025-0075",
+    "RUSTSEC-2025-0080",
+    "RUSTSEC-2025-0081",
+    "RUSTSEC-2025-0098",
+    "RUSTSEC-2025-0100",
+]
+
+[licenses]
+# Only these licenses are allowed (anything else fails).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "MPL-2.0",
+    "CC0-1.0",
+    "OpenSSL",
+    # libgit2-sys (vendored) carries GPL-2.0 WITH a linking exception; the
+    # exception permits linking into permissively/proprietarily licensed software.
+    "GPL-2.0",
+]
+confidence-threshold = 0.9
+
+[bans]
+# Only warn about multiple versions (e.g. transitively differing reqwest/rustls)
+# so the gate does not fail on unavoidable duplicates.
+multiple-versions = "warn"
+wildcards = "warn"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

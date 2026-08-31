@@ -1,0 +1,99 @@
+# ---------------------------------------------------------------------------
+# terra-git ignore set.
+#
+# Layout: a Rust workspace at the repository root plus an npm/Vite frontend and
+# the Tauri 2 bundle under apps/desktop. This file covers the whole repo; the
+# only nested ignore is apps/desktop/e2e/.gitignore, which hides the downloaded
+# WebDriver binaries next to the tests that need them.
+# ---------------------------------------------------------------------------
+
+# --- Rust / Cargo ----------------------------------------------------------
+# Unanchored on purpose: cargo invoked from crates/ or apps/desktop/src-tauri/
+# creates a target/ there too.
+target/
+**/*.rs.bk
+*.pdb
+# CARGO_HOME and the npm cache are redirected into the working copy when the
+# pipeline is run locally.
+/.cargo/
+/.npm-cache/
+# Profiling output from benchmark runs outside target/.
+perf.data
+perf.data.old
+flamegraph.svg
+
+# --- Node / npm / Vite -----------------------------------------------------
+node_modules/
+dist/
+dist-ssr/
+.vite/
+vite.config.*.timestamp-*
+*.tsbuildinfo
+.eslintcache
+coverage/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# --- Tauri 2 ---------------------------------------------------------------
+# The capability schemas are regenerated on every build. Note: if a mobile
+# target is ever added, gen/android and gen/apple are meant to be COMMITTED —
+# do not widen this to gen/.
+apps/desktop/src-tauri/gen/schemas/
+.tauri/
+
+# --- Secrets and signing material ------------------------------------------
+# None of this is in the repo today. The patterns exist so that updater
+# (minisign) and code-signing keys cannot arrive here by accident.
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# --- Local tooling and scratch output --------------------------------------
+# Working directory of gitlab-ci-local (local pipeline runs).
+.gitlab-ci-local/
+# Coding-assistant working directory.
+.claude/
+# Local analysis and scratch output.
+*-out/
+# Logs written next to the working copy while debugging.
+*.log
+# Merge and patch leftovers — routine in a Git client's own working copy.
+*.orig
+*.rej
+
+# --- Editors and IDEs ------------------------------------------------------
+.vscode/
+.idea/
+*.iml
+.zed/
+.fleet/
+.history/
+*.swp
+*.swo
+*~
+
+# --- Operating systems -----------------------------------------------------
+# macOS
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+# Windows
+Thumbs.db
+ehthumbs.db
+desktop.ini
+$RECYCLE.BIN/
+*.stackdump
+*.lnk
+# Linux
+.directory
+.Trash-*
+.fuse_hidden*
+.nfs*

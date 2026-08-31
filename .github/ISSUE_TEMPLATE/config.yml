@@ -1,0 +1,13 @@
+# Blank issues off: the two templates ask for exactly what is otherwise
+# missing to reproduce — a blank form only costs a round of follow-up questions.
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/Rynos-PCP/Terra-Git/security/advisories/new
+    about: Confidential and not public — please do not open an issue.
+  - name: Handbook
+    url: https://github.com/Rynos-PCP/Terra-Git/blob/main/docs/HANDBOOK.md
+    about: Usage, keyboard shortcuts and screenshots (English).
+  - name: Question or idea
+    url: https://github.com/Rynos-PCP/Terra-Git/discussions
+    about: For anything that is not (yet) a bug and not a concrete request.

@@ -1,0 +1,26 @@
+# EditorConfig — https://editorconfig.org
+# Keeps editors in step with the two formatters CI actually enforces:
+# rustfmt (`cargo fmt --all -- --check`) and prettier (`npm run format:check`
+# in apps/desktop, configured in apps/desktop/.prettierrc.json).
+root = true
+
+[*]
+charset = utf-8
+end_of_line = lf
+insert_final_newline = true
+trim_trailing_whitespace = true
+indent_style = space
+indent_size = 2
+
+# rustfmt defaults: 4 spaces, 100 columns.
+[*.rs]
+indent_size = 4
+max_line_length = 100
+
+# prettier: tabWidth 2, printWidth 100.
+[*.{js,mjs,cjs,ts,svelte,css,html,json,yml,yaml}]
+max_line_length = 100
+
+# Prose is wrapped by hand; leave the wrap point to the author.
+[*.md]
+max_line_length = off

@@ -1,0 +1,50 @@
+name: Feature request
+description: Something is missing or could be better
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Three things are explicitly **not** goals of the project: an
+        **integrated terminal**, a **plugin system** and a **Bitbucket
+        provider**. What *is* planned — and the reasoning behind the
+        non-goals — is in the
+        [roadmap](https://github.com/Rynos-PCP/Terra-Git/blob/main/ROADMAP.md).
+
+        A look at the
+        [feature matrix](https://github.com/Rynos-PCP/Terra-Git/blob/main/docs/FEATURES.md)
+        is worth it beforehand: the app can do more than the UI shows at
+        first glance.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem do you want to solve?
+      description: |
+        Please describe the situation, not the solution. “After every rebase I
+        have to switch to the console to check X” says more than “please
+        add a button for X”.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: How do you picture it?
+      description: If you already have an idea — go ahead. Not required, though.
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: How do you get by today?
+      description: |
+        “Not at all” is an answer too. The current workaround often reveals how
+        urgent something is.
+
+  - type: input
+    id: prior-art
+    attributes:
+      label: Is there prior art?
+      description: |
+        Another tool that solves it well (GitHub Desktop, Fork, GitKraken,
+        lazygit, magit …). A screenshot helps more than a description.

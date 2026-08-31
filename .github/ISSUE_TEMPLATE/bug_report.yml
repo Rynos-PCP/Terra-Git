@@ -1,0 +1,101 @@
+name: Bug report
+description: Something does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time. The more precise the steps, the faster
+        the bug is reproduced — and only a reproduced bug gets fixed
+        reliably.
+
+        **Please do not report security vulnerabilities here**; use the
+        private channel described in
+        [SECURITY.md](https://github.com/Rynos-PCP/Terra-Git/blob/main/SECURITY.md).
+
+  - type: textarea
+    id: what-happens
+    attributes:
+      label: What happens?
+      description: What did you see — and what did you expect instead?
+    validations:
+      required: true
+
+  - type: textarea
+    id: steps
+    attributes:
+      label: Steps to reproduce
+      description: |
+        Ideally starting from a fresh repository. If the bug only occurs
+        in a particular repo state (merge in progress, detached HEAD,
+        submodules, very many files), please say so.
+      placeholder: |
+        1. Open repository
+        2. Change a file, but do not stage it
+        3. Switch branches via the branch menu
+        4. …
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: terra-git version
+      description: Shown under Settings → App, in the start-screen footer, or in the installer file name.
+      placeholder: "1.0.0"
+    validations:
+      required: true
+
+  - type: dropdown
+    id: os
+    attributes:
+      label: Operating system
+      options:
+        - Windows
+        - macOS
+        - Linux
+    validations:
+      required: true
+
+  - type: input
+    id: os-version
+    attributes:
+      label: Exact OS version
+      placeholder: "Windows 11 23H2 / macOS 15.2 / Ubuntu 24.04"
+    validations:
+      required: true
+
+  - type: input
+    id: git-version
+    attributes:
+      label: System git version
+      description: |
+        `git --version` in a terminal. Many operations (fetch/pull/push/clone,
+        rebase, stash) run through the installed git — so the version is
+        almost always part of the picture.
+      placeholder: "git version 2.50.1"
+    validations:
+      required: true
+
+  - type: textarea
+    id: log
+    attributes:
+      label: Log excerpt
+      description: |
+        The daily log lives in the app's log directory; in the app,
+        **⋯ → Open log folder** takes you straight there. After a crash there is
+        additionally a `crash-<number>.log`.
+
+        **Please skim it first** and remove anything you do not want to
+        publish — paths often contain names, remote URLs sometimes
+        account names.
+      render: shell
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Checked beforehand
+      options:
+        - label: I have searched the existing issues and found no matching one.
+          required: true
+        - label: I am using the latest released version.
