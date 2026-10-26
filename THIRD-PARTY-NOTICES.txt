@@ -2980,7 +2980,6 @@ DEALINGS IN THE SOFTWARE.
 MIT License (MIT)
 
 Used by:
-  - png 0.17.16
   - png 0.18.1
 Copyright (c) 2015 nwin
 
@@ -5106,13 +5105,13 @@ SOFTWARE.
 MIT License (MIT)
 
 Used by:
-  - tauri-build 2.7.3
-  - tauri-codegen 2.7.3
-  - tauri-macros 2.7.3
-  - tauri-runtime-wry 2.12.2
+  - tauri-build 2.7.4
+  - tauri-codegen 2.7.4
+  - tauri-macros 2.7.4
+  - tauri-runtime-wry 2.12.3
   - tauri-runtime 2.12.2
   - tauri-utils 2.10.2
-  - tauri 2.12.4
+  - tauri 2.12.5
 MIT License
 
 Copyright (c) 2017 - Present Tauri Apps Contributors
@@ -5254,7 +5253,7 @@ SOFTWARE.
 MIT License (MIT)
 
 Used by:
-  - ico 0.5.0
+  - ico 0.6.0
 MIT License
 
 Copyright (c) 2018 Matthew D. Steele
@@ -5807,7 +5806,7 @@ Used by:
   - objc2-web-kit 0.3.2
   - objc2 0.6.4
   - siphasher 1.0.3
-  - tauri-plugin-dialog 2.8.1
+  - tauri-plugin-dialog 2.8.3
   - tauri-plugin-fs 2.7.1
   - tauri-plugin 2.7.2
   - webview2-com-macros 0.8.1
@@ -6093,7 +6092,7 @@ Used by:
   - serde_core 1.0.229
   - serde_derive 1.0.229
   - serde_derive_internals 0.29.1
-  - serde_json 1.0.151
+  - serde_json 1.0.154
   - serde_repr 0.1.21
   - servo_arc 0.4.3
   - syn 1.0.109
@@ -8241,7 +8240,7 @@ The installer ships the built frontend. These packages are part of it.
 Generated with `node scripts/gen-npm-notices.mjs`.
 
 --------------------------------------------------------------------------------
-@tauri-apps/api 2.12.2 (Apache-2.0 OR MIT)
+@tauri-apps/api 2.12.4 (Apache-2.0 OR MIT)
 https://github.com/tauri-apps/tauri#readme
 
 --- LICENSE-APACHE-2.0 ---
@@ -8471,7 +8470,7 @@ PackageDownloadLocation: git+ssh://github.com/tauri-apps/tauri.git
 Creator: Person: Daniel Thompson-Yvetot
 
 --------------------------------------------------------------------------------
-@tauri-apps/plugin-dialog 2.8.1 (MIT OR Apache-2.0)
+@tauri-apps/plugin-dialog 2.8.3 (MIT OR Apache-2.0)
 
 --- LICENSE.spdx ---
 
