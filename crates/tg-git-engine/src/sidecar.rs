@@ -72,11 +72,13 @@ pub fn run_git_long_env(repo_path: &Path, args: &[&str], envs: &[(&str, &str)]) 
 /// every sidecar error. Call once when OPENING a repo (it writes to
 /// `.git/config`), not on every internal open.
 pub fn enable_status_accelerators(repo_path: &Path) {
-    let _ = run_git(repo_path, &["config", "core.fsmonitor", "true"]);
-    let _ = run_git(repo_path, &["config", "core.untrackedCache", "true"]);
-    // The config entry alone is not enough — the untracked cache has to be
-    // created in the index.
-    let _ = run_git(repo_path, &["update-index", "--untracked-cache"]);
+    crate::repo_commands::on_its_own(|| {
+        let _ = run_git(repo_path, &["config", "core.fsmonitor", "true"]);
+        let _ = run_git(repo_path, &["config", "core.untrackedCache", "true"]);
+        // The config entry alone is not enough — the untracked cache has to be
+        // created in the index.
+        let _ = run_git(repo_path, &["update-index", "--untracked-cache"]);
+    });
 }
 
 /// Does a commit graph exist? It carries the generation numbers that let
@@ -85,7 +87,10 @@ pub fn enable_status_accelerators(repo_path: &Path) {
 /// docs/perf-stress-test.md). `rev-parse --git-path` also resolves
 /// worktree/common-dir cases correctly.
 pub(crate) fn commit_graph_ready(repo_path: &Path) -> bool {
-    let Ok(objects) = run_git(repo_path, &["rev-parse", "--git-path", "objects"]) else {
+    let objects = crate::repo_commands::on_its_own(|| {
+        run_git(repo_path, &["rev-parse", "--git-path", "objects"])
+    });
+    let Ok(objects) = objects else {
         return false;
     };
     let obj = if Path::new(&objects).is_absolute() {
@@ -103,17 +108,19 @@ pub(crate) fn commit_graph_ready(repo_path: &Path) -> bool {
 /// Errors (a very old git) are harmless, git log then simply runs without the
 /// graph.
 pub(crate) fn write_commit_graph(repo_path: &Path) -> Result<()> {
-    run_git_in(
-        repo_path,
-        &[
-            "commit-graph",
-            "write",
-            "--reachable",
-            "--split",
-            "--no-progress",
-        ],
-        CLONE_TIMEOUT,
-    )
+    crate::repo_commands::on_its_own(|| {
+        run_git_in(
+            repo_path,
+            &[
+                "commit-graph",
+                "write",
+                "--reachable",
+                "--split",
+                "--no-progress",
+            ],
+            CLONE_TIMEOUT,
+        )
+    })
     .map(|_| ())
 }
 
@@ -170,6 +177,8 @@ pub(crate) fn stream_log(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
+    // History is always the app's own call (repo_commands).
+    crate::repo_commands::on_its_own(|| crate::repo_commands::apply(&mut cmd, repo_path));
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -318,6 +327,15 @@ fn run_git_impl_env(
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    crate::repo_commands::apply(&mut cmd, dir);
+    // Not only the transfers reach a server: an LFS download during a checkout,
+    // the lazy fetch of a blobless clone, a submodule update. They must not wait
+    // on an invisible ssh question either.
+    if subcommand(args).is_some_and(|s| MAY_USE_SSH.contains(&s)) {
+        if let Some(ssh) = ssh_command_env(dir) {
+            cmd.env("GIT_SSH_COMMAND", ssh);
+        }
+    }
     for (k, v) in envs {
         cmd.env(k, v);
     }
@@ -346,7 +364,7 @@ fn run_git_impl_env(
     let err_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
+            buf = read_tail(p, STDERR_KEEP);
         }
         buf
     });
@@ -400,6 +418,129 @@ fn run_git_impl_env(
     }
 }
 
+/// How git starts `ssh` when nobody chose a program: never asking. Without a
+/// window nobody can answer ssh's questions — "Are you sure you want to
+/// continue connecting?" for an unknown host, a key passphrase — and ssh waited
+/// on an invisible console until the hour-long timeout (user report: fetch hung
+/// after the host was removed from known_hosts). Now it fails at once with
+/// "Host key verification failed." (→ the app's trust dialog) or "Permission
+/// denied" (→ manage SSH keys). `ConnectTimeout` turns an unreachable host into
+/// a network error within seconds.
+pub(crate) const NONINTERACTIVE_SSH: &str = "ssh -o BatchMode=yes -o ConnectTimeout=30";
+
+/// git subcommands that may open an ssh connection: the transfers, and
+/// everything that can download (LFS smudge, the lazy fetch of a blobless
+/// clone, submodules).
+const MAY_USE_SSH: &[&str] = &[
+    "am",
+    "checkout",
+    "cherry-pick",
+    "clone",
+    "fetch",
+    "lfs",
+    "ls-remote",
+    "merge",
+    "pull",
+    "push",
+    "read-tree",
+    "rebase",
+    "remote",
+    "reset",
+    "restore",
+    "revert",
+    "sparse-checkout",
+    "stash",
+    "submodule",
+    "switch",
+    "worktree",
+];
+
+/// The git subcommand in `args` (skipping `-c k=v`, `-C dir` and options).
+fn subcommand<'a>(args: &[&'a str]) -> Option<&'a str> {
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match *a {
+            "-c" | "-C" => {
+                it.next();
+            }
+            a if a.starts_with('-') => {}
+            a => return Some(a),
+        }
+    }
+    None
+}
+
+/// `core.sshCommand` as git itself resolves it in `dir` — `includeIf
+/// "hasconfig:remote.*.url:…"` included, which libgit2 cannot evaluate — with
+/// its scope (`local`, `worktree`, `global`, `system`, `command`).
+fn configured_ssh_command(dir: &Path) -> Option<(String, String)> {
+    let mut cmd = Command::new("git");
+    cmd.arg("-C")
+        .arg(dir)
+        .args(["config", "--show-scope", "--get", "core.sshCommand"])
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        cmd.creation_flags(0x0800_0000);
+    }
+    let out = cmd.output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let (scope, value) = text.trim_end_matches(['\r', '\n']).split_once('\t')?;
+    (!value.trim().is_empty()).then(|| (scope.to_string(), value.to_string()))
+}
+
+/// The user's own OpenSSH call, made non-interactive as [`NONINTERACTIVE_SSH`]
+/// — unless it already decides BatchMode/ConnectTimeout itself.
+fn noninteractive(command: &str) -> String {
+    let low = command.to_ascii_lowercase();
+    let mut out = command.to_string();
+    if !low.contains("batchmode") {
+        out.push_str(" -o BatchMode=yes");
+    }
+    if !low.contains("connecttimeout") {
+        out.push_str(" -o ConnectTimeout=30");
+    }
+    out
+}
+
+/// The `GIT_SSH_COMMAND` for a git call in `dir`; `None` leaves it to git.
+/// - The environment names a program (`GIT_SSH_COMMAND`, `GIT_SSH`): left alone.
+/// - No `core.sshCommand`: [`NONINTERACTIVE_SSH`].
+/// - A repo-level command that is not a plain ssh call
+///   ([`crate::repo_commands::is_plain_ssh`]) never runs: [`NONINTERACTIVE_SSH`]
+///   replaces it, and transfers refuse with a reason
+///   ([`reject_local_credential_hooks`]).
+/// - Any other OpenSSH call: it, plus BatchMode and ConnectTimeout.
+/// - Another program of the user's own (plink): left alone.
+pub(crate) fn ssh_command_env(dir: &Path) -> Option<String> {
+    let set = |v: Option<std::ffi::OsString>| v.is_some_and(|v| !v.is_empty());
+    if set(std::env::var_os("GIT_SSH_COMMAND")) || set(std::env::var_os("GIT_SSH")) {
+        return None;
+    }
+    ssh_command_for(configured_ssh_command(dir))
+}
+
+fn ssh_command_for(configured: Option<(String, String)>) -> Option<String> {
+    let Some((scope, value)) = configured else {
+        return Some(NONINTERACTIVE_SSH.to_string());
+    };
+    let repo_level = matches!(scope.as_str(), "local" | "worktree");
+    if repo_level && !crate::repo_commands::is_plain_ssh(&value) {
+        Some(NONINTERACTIVE_SSH.to_string())
+    } else if crate::repo_commands::starts_ssh(&value) {
+        Some(noninteractive(&value))
+    } else {
+        None
+    }
+}
+
 /// Parses a `git --progress` line into phase + percent. `None` when the line
 /// carries no progress (e.g. plain "done." or status lines).
 /// Git writes progress to stderr, updated with `\r` separators:
@@ -423,12 +564,19 @@ pub(crate) fn parse_progress(line: &str) -> Option<GitProgress> {
     Some(GitProgress {
         phase: normalize_phase(phase_raw),
         percent: percent.min(100),
+        done: None,
+        total: None,
     })
 }
 
 fn normalize_phase(raw: &str) -> String {
     let low = raw.to_ascii_lowercase();
+    // git-lfs: "Downloading LFS objects", "Checking out LFS objects".
+    if low.contains("checking out") {
+        return "checkout".to_string();
+    }
     for key in [
+        "downloading",
         "receiving",
         "resolving",
         "compressing",
@@ -469,6 +617,15 @@ pub fn run_git_streaming(
         use std::os::windows::process::CommandExt;
         cmd.creation_flags(0x0800_0000);
     }
+    // English messages, whatever the user's locale: the remote-error
+    // classifier and the progress phases match git's English wording — with a
+    // German git every remote error used to fall through to `sidecar_failed`
+    // and every progress phase to "other".
+    cmd.env("LC_ALL", "C");
+    crate::repo_commands::apply(&mut cmd, dir);
+    if let Some(ssh) = ssh_command_env(dir) {
+        cmd.env("GIT_SSH_COMMAND", ssh);
+    }
     tracing::debug!(?args, dir = %dir.display(), "sidecar: git (streaming)");
     let mut child = cmd.spawn()?;
 
@@ -493,14 +650,22 @@ pub fn run_git_streaming(
             let mut byte = [0u8; 1];
             while let Ok(1) = p.read(&mut byte) {
                 raw.push(byte[0]);
+                // Bounded like read_tail: a server can send sideband text for
+                // as long as the transfer runs.
+                if raw.len() > 2 * STDERR_KEEP {
+                    raw.drain(..raw.len() - STDERR_KEEP);
+                }
                 if byte[0] == b'\r' || byte[0] == b'\n' {
                     flush_segment(&mut seg, &tx);
-                } else {
+                } else if seg.len() < MAX_PROGRESS_LINE {
                     seg.push(byte[0]);
                 }
             }
         }
         flush_segment(&mut seg, &tx);
+        if raw.len() > STDERR_KEEP {
+            raw.drain(..raw.len() - STDERR_KEEP);
+        }
         String::from_utf8_lossy(&raw).into_owned()
     });
 
@@ -560,6 +725,37 @@ pub fn run_git_streaming(
             },
         })
     }
+}
+
+/// How much of a git child's stderr is kept: the end, where git puts the error.
+/// A server can stream sideband text for as long as a transfer runs (up to an
+/// hour); memory and the log entry stay bounded.
+pub(crate) const STDERR_KEEP: usize = 256 * 1024;
+
+/// A progress line longer than this is no progress line; the rest is dropped.
+const MAX_PROGRESS_LINE: usize = 4096;
+
+/// Reads `r` to the end and keeps only the last `keep` bytes.
+pub(crate) fn read_tail(r: &mut impl Read, keep: usize) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut chunk = [0u8; 8192];
+    loop {
+        match r.read(&mut chunk) {
+            Ok(0) => break,
+            Ok(n) => {
+                buf.extend_from_slice(&chunk[..n]);
+                if buf.len() > 2 * keep {
+                    buf.drain(..buf.len() - keep);
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    if buf.len() > keep {
+        buf.drain(..buf.len() - keep);
+    }
+    buf
 }
 
 fn flush_segment(seg: &mut Vec<u8>, tx: &std::sync::mpsc::Sender<GitProgress>) {
@@ -713,6 +909,9 @@ pub fn rebase_interactive(
         &[
             "-c",
             "rebase.autosquash=false",
+            // Base column in the conflict workshop.
+            "-c",
+            "merge.conflictStyle=diff3",
             "rebase",
             "-i",
             "--autostash",
@@ -758,10 +957,134 @@ pub fn sparse_checkout_disable(repo_path: &Path) -> Result<String> {
 /// Classifies a failed remote operation from the git output into a stable code +
 /// an action-oriented message. Order: from specific to general. `None` = no
 /// known signature.
-pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)> {
-    let t = text.to_ascii_lowercase();
+/// git's own lines of an output: without the sideband (`remote: …`), which the
+/// SERVER writes. A local cause must never be read from it — the server would
+/// otherwise pick which way out the error toast offers (remove a lock, trust a
+/// folder, delete a branch).
+fn own_lines(text: &str) -> String {
+    text.split(['\n', '\r'])
+        .filter(|l| !l.trim_start().starts_with("remote:"))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Classifies git output of a LOCAL failure — the errors that
+/// can come from any git call, remote or not. Also applied to unclassified
+/// sidecar errors ([`GitEngineError::code`]), so it holds only patterns that
+/// cannot be mistaken for something else. Reads git's own lines only.
+pub(crate) fn classify_local_error(text: &str) -> Option<(&'static str, String)> {
+    let t = own_lines(text).to_ascii_lowercase();
     let has = |n: &str| t.contains(n);
 
+    // Not "git-lfs … not found" in general: the LFS server's "Repository or
+    // object not found" must stay a server error.
+    if has("'lfs' is not a git command")
+        || has("git-lfs: command not found")
+        || has("'git-lfs' was not found")
+    {
+        return Some((
+            "lfs_missing",
+            "This repository uses Git LFS, but git-lfs is not installed. Install it \
+             (git-lfs.com) and run the operation again."
+                .into(),
+        ));
+    }
+    // "File exists" only: "Unable to create … index.lock: Permission denied" is
+    // no leftover lock, and removing a lock would not help.
+    if has("index.lock") && has("file exists") {
+        return Some((
+            "index_locked",
+            "Another git process seems to be running in this repository (index.lock \
+             exists). If none is running, the lock file is left over and can be removed."
+                .into(),
+        ));
+    }
+    if has("detected dubious ownership") {
+        return Some((
+            "unsafe_repository",
+            "git does not trust this folder: it belongs to another user. Mark it as \
+             safe (safe.directory) if you trust it."
+                .into(),
+        ));
+    }
+    if has("please tell me who you are")
+        || has("unable to auto-detect email address")
+        || has("empty ident name")
+    {
+        return Some((
+            "identity_missing",
+            "No git identity: user.name and user.email are not set.".into(),
+        ));
+    }
+    if has("filename too long") || has("path too long") {
+        return Some((
+            "path_too_long",
+            "A path is too long for Windows. Enable long paths for this repository \
+             (core.longpaths)."
+                .into(),
+        ));
+    }
+    if has("gpg failed") || has("failed to sign") || has("cannot run gpg") {
+        return Some((
+            "signing_failed",
+            "Signing the commit failed. Check the signing key and the signing \
+             settings — or commit once without a signature."
+                .into(),
+        ));
+    }
+    if has("refusing to merge unrelated histories") {
+        return Some((
+            "unrelated_histories",
+            "The two branches share no history. Merging them anyway joins two \
+             independent histories."
+                .into(),
+        ));
+    }
+    if has("you are not currently on a branch") {
+        return Some((
+            "detached_push",
+            "No branch is checked out (detached HEAD) — create a branch here to \
+             publish these commits."
+                .into(),
+        ));
+    }
+    // A file the operating system refused — not ssh's "Permission denied
+    // (publickey…)", which the remote classifier names.
+    if has("permission denied") && !has("permission denied (") {
+        return Some((
+            "io_error",
+            "Access denied: git could not read or write a file (permission denied). \
+             Check the folder's permissions, or whether another program holds the file."
+                .into(),
+        ));
+    }
+    None
+}
+
+/// Classifies the output of a failed git call into a stable,
+/// action-oriented code (remote operations and local multi-step ops).
+/// Everything with a way out reads git's own lines; only the server's
+/// verdicts (refused, not found, authentication) may come from its sideband.
+pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)> {
+    if let Some(local) = classify_local_error(text) {
+        return Some(local);
+    }
+    let t = own_lines(text).to_ascii_lowercase();
+    let has = |n: &str| t.contains(n);
+    let all = text.to_ascii_lowercase();
+    let server_says = |n: &str| all.contains(n);
+
+    // Before ssh_auth: "no matching host key type found" is an algorithm
+    // mismatch, not a rejected key.
+    if has("no matching host key type") {
+        return Some((
+            "ssh_hostkey_algo",
+            "The server offers only SSH host key types your SSH client does not accept \
+             (often an old server with ssh-rsa). The server needs a newer key type, or \
+             the host an exception in the SSH config."
+                .into(),
+        ));
+    }
     if has("host key verification failed") || has("remote host identification has changed") {
         return Some((
             "host_key",
@@ -770,7 +1093,7 @@ pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)
                 .into(),
         ));
     }
-    if has("permission denied (publickey") || has("no matching host key") {
+    if has("permission denied (publickey") {
         return Some((
             "ssh_auth",
             "SSH authentication failed (no matching key). Is the right key loaded in \
@@ -779,7 +1102,10 @@ pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)
         ));
     }
     // Force push rejected by --force-with-lease (the remote has moved).
-    if has("stale info") || (has("force-with-lease") && has("reject")) {
+    if has("stale info")
+        || has("remote ref updated since checkout")
+        || (has("force-with-lease") && has("reject"))
+    {
         return Some((
             "force_lease_stale",
             "Force push rejected: the remote branch has changed since the last fetch. \
@@ -806,18 +1132,19 @@ pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)
     let http_403 = ["http 403", "error: 403", "status code: 403"]
         .iter()
         .any(|p| {
-            t.match_indices(p).any(|(i, m)| {
-                t.as_bytes()
+            all.match_indices(p).any(|(i, m)| {
+                all.as_bytes()
                     .get(i + m.len())
                     .is_none_or(|b| !b.is_ascii_alphanumeric())
             })
         })
-        || has("403 forbidden");
-    if has("pre-receive hook declined")
-        || has("protected branch")
-        || has("you are not allowed")
+        || server_says("403 forbidden");
+    // The server's own verdicts: these may come from its sideband.
+    if server_says("pre-receive hook declined")
+        || server_says("protected branch")
+        || server_says("you are not allowed")
         || http_403
-        || has("access denied")
+        || server_says("access denied")
     {
         return Some((
             "forbidden",
@@ -826,11 +1153,11 @@ pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)
                 .into(),
         ));
     }
-    if has("authentication failed")
+    if server_says("authentication failed")
         || has("could not read username")
-        || has("invalid username or password")
+        || server_says("invalid username or password")
         || has("terminal prompts disabled")
-        || has("http basic: access denied")
+        || server_says("http basic: access denied")
     {
         return Some((
             "auth_failed",
@@ -839,10 +1166,29 @@ pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)
                 .into(),
         ));
     }
-    if (has("repository") && has("not found")) || has("does not appear to be a git repository") {
+    if (server_says("repository") && server_says("not found"))
+        || has("does not appear to be a git repository")
+    {
         return Some((
             "repo_not_found",
             "Repository not found on the remote. Check the URL (and whether you have access)."
+                .into(),
+        ));
+    }
+    // The upstream branch was deleted on the remote: a pull finds nothing.
+    if has("no such ref was fetched") || has("couldn't find remote ref") {
+        return Some((
+            "upstream_gone",
+            "The remote branch this branch follows no longer exists. Publish the \
+             branch again, or remove the upstream."
+                .into(),
+        ));
+    }
+    if has("shallow update not allowed") {
+        return Some((
+            "shallow_rejected",
+            "The remote rejected the push because this clone is shallow. Fetch the \
+             full history and push again."
                 .into(),
         ));
     }
@@ -851,6 +1197,30 @@ pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)
             "no_upstream",
             "No upstream set for this branch. The first push creates one automatically; \
              otherwise pick a remote target."
+                .into(),
+        ));
+    }
+    // Local changes in the way: git refuses before touching anything (pull,
+    // merge, rebase). Tracked and untracked alike — the way out is the same
+    // (bring them along through a stash). Checked BEFORE the divergence and
+    // conflict patterns: these messages can mention neither.
+    if has("would be overwritten by")
+        || has("cannot pull with rebase")
+        || has("cannot rebase: you have unstaged changes")
+        || has("please commit your changes or stash them")
+    {
+        return Some((
+            "local_changes_overwritten",
+            "Uncommitted changes are in the way: git would overwrite them. Bring them \
+             along (stash), commit them, or discard them first."
+                .into(),
+        ));
+    }
+    if has("not possible to fast-forward") {
+        return Some((
+            "divergent",
+            "The branches have diverged and only a fast-forward was allowed. Merge or \
+             rebase them."
                 .into(),
         ));
     }
@@ -865,14 +1235,37 @@ pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)
     if has("conflict") || has("automatic merge failed") {
         return Some((
             "merge_conflict",
-            "The pull created conflicts. Resolve them in the conflict view and continue \
-             the operation afterwards."
+            "The operation stopped on conflicts. Resolve them in the conflict workshop and \
+             continue it afterwards."
                 .into(),
         ));
     }
+    // Before network: the TLS failure arrives as "unable to access … SSL
+    // certificate problem".
+    if has("ssl certificate problem")
+        || has("server certificate verification failed")
+        || has("certificate verify failed")
+        || has("self-signed certificate")
+        || has("self signed certificate")
+        || has("unable to get local issuer certificate")
+        // Windows' own TLS backend (schannel, Git for Windows' default).
+        || has("sec_e_untrusted_root")
+        || has("cert_trust_is_untrusted_root")
+        || has("certgetcertificatechain trust error")
+        || has("sec_e_cert_expired")
+        || has("cert_trust_is_not_time_valid")
+    {
+        return Some((
+            "tls_cert",
+            "The server's certificate is not trusted (self-signed or an unknown \
+             authority). Allow it for this host only if you know the server."
+                .into(),
+        ));
+    }
+    // "unable to access" only for a URL: git says the same about a local file.
     if has("could not resolve host")
         || has("failed to connect")
-        || has("unable to access")
+        || has("unable to access 'http")
         || has("connection timed out")
         || has("could not read from remote repository")
         || has("operation timed out")
@@ -889,11 +1282,100 @@ pub(crate) fn classify_remote_error(text: &str) -> Option<(&'static str, String)
 
 /// Runs a remote operation and classifies errors into a stable,
 /// action-oriented [`GitEngineError::Remote`].
+/// How a pull combines diverged histories.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullStrategy {
+    Merge,
+    Rebase,
+    FastForwardOnly,
+    /// A merge that joins two histories without a common commit
+    /// (`unrelated_histories`) — only ever chosen explicitly.
+    MergeUnrelated,
+    /// The user's answer in the "diverged" or "push rejected" dialog, or the
+    /// strategy remembered for this repository: merge, whatever git's
+    /// configuration says (`--ff` beats a `pull.ff=only`).
+    MergeChosen,
+    /// Like [`Self::MergeChosen`], rebasing.
+    RebaseChosen,
+}
+
+impl PullStrategy {
+    /// From the frontend's value; unknown values are refused.
+    pub fn parse(value: &str) -> Result<Self> {
+        match value {
+            "merge" => Ok(Self::Merge),
+            "rebase" => Ok(Self::Rebase),
+            "ff-only" => Ok(Self::FastForwardOnly),
+            "merge-unrelated" => Ok(Self::MergeUnrelated),
+            "merge-chosen" => Ok(Self::MergeChosen),
+            "rebase-chosen" => Ok(Self::RebaseChosen),
+            other => Err(GitEngineError::InvalidOperation(format!(
+                "Unknown pull strategy: {other}"
+            ))),
+        }
+    }
+
+    fn flags(self) -> &'static [&'static str] {
+        match self {
+            Self::Merge => &["--no-rebase"],
+            Self::Rebase | Self::RebaseChosen => &["--rebase"],
+            Self::FastForwardOnly => &["--ff-only"],
+            Self::MergeUnrelated => &["--no-rebase", "--ff", "--allow-unrelated-histories"],
+            Self::MergeChosen => &["--no-rebase", "--ff"],
+        }
+    }
+
+    /// The user's explicit answer to a refused pull — it overrides a
+    /// configured `pull.rebase`/`pull.ff` (without it, "Merge" in the diverged
+    /// dialog ran into `pull.ff=only` again and again).
+    pub fn is_explicit(self) -> bool {
+        matches!(
+            self,
+            Self::MergeUnrelated | Self::MergeChosen | Self::RebaseChosen
+        )
+    }
+}
+
+/// Classifies the output of a failed git call (remote or local merge/rebase)
+/// into a stable code — see [`classify_remote_error`].
+pub(crate) fn classified(res: Result<String>) -> Result<String> {
+    remote_op(res)
+}
+
+/// A push: classified like every remote operation — and an otherwise
+/// unexplained failure in a repo with a `pre-push` hook is that hook stopping
+/// it (`hook_failed`); its output is the detail. A rejection by
+/// the server names itself (`[rejected]`), so that never counts as the hook,
+/// and neither does the hook git-lfs installs: its failures are LFS upload
+/// errors, and every push in an LFS repository would otherwise blame a hook.
+fn push_op(repo_path: &Path, res: Result<String>) -> Result<String> {
+    match remote_op(res) {
+        Err(GitEngineError::Sidecar { message })
+            if !message.contains("[rejected]")
+                && !message.contains("[remote rejected]")
+                && git2::Repository::discover(repo_path).is_ok_and(|r| {
+                    crate::hook_exists(&r, "pre-push") && !crate::pre_push_is_git_lfs(&r)
+                }) =>
+        {
+            Err(GitEngineError::Remote {
+                code: "hook_failed",
+                message: "The pre-push hook stopped the push — its output is below.".into(),
+                raw: message,
+            })
+        }
+        other => other,
+    }
+}
+
 fn remote_op(res: Result<String>) -> Result<String> {
     match res {
         Ok(v) => Ok(v),
         Err(GitEngineError::Sidecar { message }) => match classify_remote_error(&message) {
-            Some((code, msg)) => Err(GitEngineError::Remote { code, message: msg }),
+            Some((code, msg)) => Err(GitEngineError::Remote {
+                code,
+                message: msg,
+                raw: message,
+            }),
             None => Err(GitEngineError::Sidecar { message }),
         },
         Err(e) => Err(e),
@@ -980,55 +1462,40 @@ fn insecure_hosts() -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// Config keys whose repo-local value makes git run a COMMAND during a remote
-/// operation. `credential.helper` is multi-valued: the app's own `-c` is
-/// APPENDED to the list, so a repo-local `helper = "!<command>"` still runs (and
-/// runs first). `core.askPass` is a program git starts when it needs a password;
-/// `GIT_TERMINAL_PROMPT=0` only suppresses the TERMINAL fallback, not these two.
-const LOCAL_CREDENTIAL_HOOKS: &[&str] = &["credential.helper", "core.askpass"];
-
-/// Refuses a remote operation when the repository's OWN `.git/config` defines a
-/// credential hook.
+/// Refuses a remote operation when the repository's OWN configuration defines a
+/// program git would run during the transfer
+/// ([`crate::repo_commands::transfer_command`]).
 ///
 /// A `.git` directory someone else supplied (an unpacked archive, a network
 /// share, a USB stick) is executable code as far as git is concerned. All it
 /// takes is a remote whose server answers 401 and a repo-local
 /// `[credential] helper = "!<command>"`, and a single click on Fetch runs that
 /// command — without any dialog and without a compromised renderer.
+/// `credential.helper` is multi-valued: the app's own `-c` is APPENDED to the
+/// list, so a repo-local helper still runs (and runs first). The same goes for
+/// URL-scoped helpers, `core.askPass` (`GIT_TERMINAL_PROMPT=0` only suppresses
+/// the terminal fallback), `core.gitProxy`, upload/receive-pack programs of a
+/// local remote and an ssh command that is more than a plain `ssh` call.
 ///
 /// Same stance as `open_mergetool`: repo-local command definitions are not
 /// executed, and the user is told why instead of being handed a cryptic git
-/// error. Global/system helpers (Windows Credential Manager, osxkeychain,
-/// libsecret) are untouched — they are not attacker-controlled.
+/// error. Global/system settings (Windows Credential Manager, osxkeychain,
+/// libsecret, the user's own ssh command) are untouched — they are not
+/// attacker-controlled.
 pub(crate) fn reject_local_credential_hooks(repo_path: &Path) -> Result<()> {
-    let Ok(repo) = git2::Repository::open(repo_path) else {
-        return Ok(());
-    };
-    let Ok(config) = repo.config() else {
-        return Ok(());
-    };
-    let Ok(local) = config.open_level(git2::ConfigLevel::Local) else {
-        return Ok(());
-    };
-    for key in LOCAL_CREDENTIAL_HOOKS {
-        // Multi-valued: a single entry is enough, so check the whole multivar.
-        let found = local
-            .multivar(key, None)
-            .map(|mut e| e.next().is_some())
-            .unwrap_or(false);
-        if found {
-            return Err(GitEngineError::Remote {
-                code: "local_credential_hook",
-                message: format!(
-                    "This repository carries its own `{key}` in .git/config. git would run \
-                     that as a command during the transfer, so terra-git refuses the remote \
-                     operation. Remove the entry (git config --unset {key}) or set the \
-                     credential helper in your global git configuration."
-                ),
-            });
-        }
+    match crate::repo_commands::transfer_command(repo_path) {
+        None => Ok(()),
+        Some(key) => Err(GitEngineError::Remote {
+            code: "local_credential_hook",
+            message: format!(
+                "This repository carries its own `{key}` in .git/config. git would run \
+                 that as a command during the transfer, so terra-git refuses the remote \
+                 operation. Remove the entry (git config --unset {key}) or move it to your \
+                 global git configuration."
+            ),
+            raw: key,
+        }),
     }
-    Ok(())
 }
 
 /// HTTPS remote URLs of a local repo (empty when it cannot be opened).
@@ -1097,13 +1564,30 @@ fn leading_config(cred: &Option<String>, insecure: &[String]) -> Vec<String> {
 }
 
 pub fn fetch(repo_path: &Path) -> Result<String> {
-    fetch_streaming(repo_path, &CancelToken::new(), &mut |_| {})
+    fetch_streaming(
+        repo_path,
+        FetchTarget::Default,
+        &CancelToken::new(),
+        &mut |_| {},
+    )
 }
 
 /// Like [`fetch`], but streams the progress to `on` and is cancellable through
 /// `cancel`.
+/// What a fetch fetches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FetchTarget<'a> {
+    /// git's default remote (the upstream's, else origin).
+    Default,
+    /// Every remote (`--all`).
+    All,
+    /// One named remote.
+    Remote(&'a str),
+}
+
 pub fn fetch_streaming(
     repo_path: &Path,
+    target: FetchTarget<'_>,
     cancel: &CancelToken,
     on: &mut dyn FnMut(GitProgress),
 ) -> Result<String> {
@@ -1114,6 +1598,15 @@ pub fn fetch_streaming(
     );
     let mut args: Vec<&str> = lead.iter().map(String::as_str).collect();
     args.extend(["fetch", "--prune", "--progress"]);
+    match target {
+        FetchTarget::Default => {}
+        FetchTarget::All => args.push("--all"),
+        FetchTarget::Remote(remote) => {
+            // Free user input: no option injection, positional after `--`.
+            reject_remote_option(remote)?;
+            args.extend(["--", remote]);
+        }
+    }
     let out = remote_op(run_git_streaming(
         repo_path,
         &args,
@@ -1125,16 +1618,9 @@ pub fn fetch_streaming(
     Ok(out)
 }
 
-pub fn pull(repo_path: &Path) -> Result<String> {
-    pull_streaming(repo_path, false, &CancelToken::new(), &mut |_| {})
-}
-
-/// Like [`pull`], but streams the progress to `on` and is cancellable.
-/// `prune = true` appends `--prune` (removes dead remote-tracking refs on pull,
-/// analogous to `git fetch --prune`).
-pub fn pull_streaming(
+/// `git fetch --unshallow` (`shallow_rejected`), with progress.
+pub fn fetch_unshallow_streaming(
     repo_path: &Path,
-    prune: bool,
     cancel: &CancelToken,
     on: &mut dyn FnMut(GitProgress),
 ) -> Result<String> {
@@ -1144,11 +1630,90 @@ pub fn pull_streaming(
         &insecure_tls_configs(repo_path),
     );
     let mut args: Vec<&str> = lead.iter().map(String::as_str).collect();
+    args.extend(["fetch", "--unshallow", "--progress"]);
+    let out = remote_op(run_git_streaming(
+        repo_path,
+        &args,
+        CLONE_TIMEOUT,
+        cancel,
+        on,
+    ))?;
+    maintain_commit_graph(repo_path);
+    Ok(out)
+}
+
+/// `git lfs pull`: downloads the LFS objects of the
+/// checked-out commit and writes their content in place of the pointers.
+/// `lfs.forceprogress`: git-lfs is silent without a terminal otherwise.
+pub fn lfs_pull_streaming(
+    repo_path: &Path,
+    cancel: &CancelToken,
+    on: &mut dyn FnMut(GitProgress),
+) -> Result<String> {
+    reject_local_credential_hooks(repo_path)?;
+    let lead = leading_config(
+        &credential_helper_config(),
+        &insecure_tls_configs(repo_path),
+    );
+    let mut args: Vec<&str> = lead.iter().map(String::as_str).collect();
+    args.extend(["-c", "lfs.forceprogress=true", "lfs", "pull"]);
+    remote_op(run_git_streaming(
+        repo_path,
+        &args,
+        CLONE_TIMEOUT,
+        cancel,
+        on,
+    ))
+}
+
+pub fn pull(repo_path: &Path) -> Result<String> {
+    pull_streaming(
+        repo_path,
+        false,
+        None,
+        None,
+        &CancelToken::new(),
+        &mut |_| {},
+    )
+}
+
+/// Like [`pull`], but streams the progress to `on` and is cancellable.
+/// `prune = true` appends `--prune` (removes dead remote-tracking refs on pull,
+/// analogous to `git fetch --prune`).
+pub fn pull_streaming(
+    repo_path: &Path,
+    prune: bool,
+    strategy: Option<PullStrategy>,
+    from: Option<(&str, &str)>,
+    cancel: &CancelToken,
+    on: &mut dyn FnMut(GitProgress),
+) -> Result<String> {
+    reject_local_credential_hooks(repo_path)?;
+    let lead = leading_config(
+        &credential_helper_config(),
+        &insecure_tls_configs(repo_path),
+    );
+    let mut args: Vec<&str> = lead.iter().map(String::as_str).collect();
+    // Base column in the conflict workshop.
+    args.extend(["-c", "merge.conflictStyle=diff3"]);
     args.push("pull");
     if prune {
         args.push("--prune");
     }
+    if let Some(s) = strategy {
+        args.extend(s.flags());
+    }
+    // Options before the `--`: everything after it is a remote or a refspec.
     args.push("--progress");
+    // From an explicitly chosen remote and branch instead of
+    // the upstream. Both are free user input — validated, after `--`. (git pull
+    // hands what follows to git fetch without its own `--`, so the leading-`-`
+    // checks are what really protects the fetch; keep them.)
+    if let Some((remote, branch)) = from {
+        reject_remote_option(remote)?;
+        validate_branch_name(branch)?;
+        args.extend(["--", remote, branch]);
+    }
     let out = remote_op(run_git_streaming(
         repo_path,
         &args,
@@ -1218,13 +1783,10 @@ pub fn push_streaming(
         args.push(remote);
         args.push(name);
     }
-    remote_op(run_git_streaming(
+    push_op(
         repo_path,
-        &args,
-        CLONE_TIMEOUT,
-        cancel,
-        on,
-    ))
+        run_git_streaming(repo_path, &args, CLONE_TIMEOUT, cancel, on),
+    )
 }
 
 /// Push explicitly to `remote` (not to the upstream), e.g. from the push
@@ -1273,13 +1835,41 @@ pub fn push_to_streaming(
     args.push("--");
     args.push(remote);
     args.push(branch.unwrap_or("HEAD"));
-    remote_op(run_git_streaming(
+    push_op(
         repo_path,
-        &args,
-        CLONE_TIMEOUT,
-        cancel,
-        on,
-    ))
+        run_git_streaming(repo_path, &args, CLONE_TIMEOUT, cancel, on),
+    )
+}
+
+/// Pushes `commit` as `refs/heads/<branch>` to `remote` — publishes a branch
+/// at a chosen commit instead of its tip.
+pub fn push_commit_as_branch(
+    repo_path: &Path,
+    remote: &str,
+    commit: &str,
+    branch: &str,
+    cancel: &CancelToken,
+    on: &mut dyn FnMut(GitProgress),
+) -> Result<String> {
+    reject_local_credential_hooks(repo_path)?;
+    reject_remote_option(remote)?;
+    validate_branch_name(branch)?;
+    if commit.len() < 7 || !commit.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return Err(GitEngineError::InvalidOperation(format!(
+            "Not a commit id: {commit}"
+        )));
+    }
+    let lead = leading_config(
+        &credential_helper_config(),
+        &insecure_tls_configs(repo_path),
+    );
+    let refspec = format!("{commit}:refs/heads/{branch}");
+    let mut args: Vec<&str> = lead.iter().map(String::as_str).collect();
+    args.extend(["push", "--progress", "--", remote, &refspec]);
+    push_op(
+        repo_path,
+        run_git_streaming(repo_path, &args, CLONE_TIMEOUT, cancel, on),
+    )
 }
 
 /// Validates a clone URL against option and transport injection.
@@ -1420,7 +2010,14 @@ pub fn clone_fetch(
     let checkout = |target: &str| -> Result<String> {
         let mut co: Vec<&str> = lead.iter().map(String::as_str).collect();
         co.extend(["checkout", target]);
-        remote_op(run_git_in(path, &co, CLONE_TIMEOUT))
+        // English messages for the classifier, as in run_git_streaming.
+        remote_op(run_git_impl_env(
+            path,
+            &co,
+            CLONE_TIMEOUT,
+            true,
+            &[("LC_ALL", "C")],
+        ))
     };
     match branch {
         // Check out exactly the chosen branch (with a single remote, DWIM creates
@@ -1459,9 +2056,10 @@ fn detect_default_branch(path: &Path, cred: &Option<String>) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        classify_remote_error, credential_helper_config, https_host, insecure_hosts,
-        leading_config, parse_progress, reject_remote_option, run_git, select_insecure_configs,
-        set_insecure_tls_hosts, sh_single_quote, validate_remote_url,
+        classify_remote_error, configured_ssh_command, credential_helper_config, https_host,
+        insecure_hosts, leading_config, parse_progress, reject_remote_option, run_git,
+        select_insecure_configs, set_insecure_tls_hosts, sh_single_quote, ssh_command_for,
+        subcommand, validate_remote_url, NONINTERACTIVE_SSH,
     };
 
     #[test]
@@ -1646,6 +2244,130 @@ mod tests {
         std::env::remove_var("TERRA_GIT_CREDENTIAL_EXE");
     }
 
+    /// One case per error code, with git's real output.
+    #[test]
+    fn classifies_the_common_errors() {
+        let cases = [
+            (
+                "fatal: Unable to create 'C:/r/.git/index.lock': File exists.\n\nAnother git process seems to be running in this repository",
+                "index_locked",
+            ),
+            (
+                "fatal: detected dubious ownership in repository at 'D:/shared/r'\n'D:/shared/r' is owned by:\n\tBUILTIN/Administrators",
+                "unsafe_repository",
+            ),
+            (
+                "Author identity unknown\n\n*** Please tell me who you are.\n\nRun\n\n  git config --global user.email",
+                "identity_missing",
+            ),
+            (
+                "fatal: unable to access 'https://git.example.com/a/b.git/': SSL certificate problem: self-signed certificate in certificate chain",
+                "tls_cert",
+            ),
+            (
+                "fatal: unable to access 'https://git.example.com/a/b.git/': server certificate verification failed. CAfile: none CRLfile: none",
+                "tls_cert",
+            ),
+            ("fatal: refusing to merge unrelated histories", "unrelated_histories"),
+            (
+                "fatal: You are not currently on a branch.\nTo push the history leading to the current (detached HEAD)",
+                "detached_push",
+            ),
+            (
+                "Your configuration specifies to merge with the ref 'refs/heads/feature'\nfrom the remote, but no such ref was fetched.",
+                "upstream_gone",
+            ),
+            ("fatal: couldn't find remote ref feature", "upstream_gone"),
+            (
+                " ! [remote rejected] main -> main (shallow update not allowed)\nerror: failed to push some refs",
+                "shallow_rejected",
+            ),
+            (
+                "error: unable to create file src/very/long/path/file.txt: Filename too long",
+                "path_too_long",
+            ),
+            (
+                "error: gpg failed to sign the data\nfatal: failed to write commit object",
+                "signing_failed",
+            ),
+            (
+                "Unable to negotiate with 10.0.0.5 port 22: no matching host key type found. Their offer: ssh-rsa",
+                "ssh_hostkey_algo",
+            ),
+            (
+                "fatal: unable to access 'https://host/x.git/': Could not resolve host: host",
+                "network",
+            ),
+        ];
+        for (text, code) in cases {
+            assert_eq!(code_of(text), Some(code), "{text}");
+        }
+        // A rejected key stays ssh_auth.
+        assert_eq!(
+            code_of("git@host: Permission denied (publickey)."),
+            Some("ssh_auth")
+        );
+    }
+
+    #[test]
+    fn ssh_never_asks_and_never_runs_a_supplied_program() {
+        let own = |scope: &str, v: &str| ssh_command_for(Some((scope.to_string(), v.to_string())));
+        assert_eq!(ssh_command_for(None).as_deref(), Some(NONINTERACTIVE_SSH));
+        // The user's own OpenSSH call keeps its options and stops asking.
+        assert_eq!(
+            own("global", "ssh -i ~/.ssh/work").as_deref(),
+            Some("ssh -i ~/.ssh/work -o BatchMode=yes -o ConnectTimeout=30")
+        );
+        assert_eq!(
+            own("local", "ssh -i k -o BatchMode=no").as_deref(),
+            Some("ssh -i k -o BatchMode=no -o ConnectTimeout=30")
+        );
+        // A program of the user's own that is not OpenSSH stays untouched.
+        assert_eq!(own("global", "plink -batch"), None);
+        // A repo-level command that is more than plain ssh never runs.
+        for evil in [
+            "sh -c 'touch pwned'",
+            "ssh -o ProxyCommand=evil",
+            "plink -batch",
+        ] {
+            assert_eq!(
+                own("local", evil).as_deref(),
+                Some(NONINTERACTIVE_SSH),
+                "{evil}"
+            );
+            assert_eq!(
+                own("worktree", evil).as_deref(),
+                Some(NONINTERACTIVE_SSH),
+                "{evil}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_ssh_command_is_read_the_way_git_reads_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        repo.config()
+            .unwrap()
+            .set_str("core.sshCommand", "ssh -i key")
+            .unwrap();
+        let (scope, value) = configured_ssh_command(dir.path()).expect("configured");
+        assert_eq!((scope.as_str(), value.as_str()), ("local", "ssh -i key"));
+    }
+
+    #[test]
+    fn subcommand_skips_global_options() {
+        assert_eq!(
+            subcommand(&["-c", "a=b", "fetch", "--prune"]),
+            Some("fetch")
+        );
+        assert_eq!(
+            subcommand(&["--no-optional-locks", "status"]),
+            Some("status")
+        );
+        assert_eq!(subcommand(&["-C", "x", "lfs", "pull"]), Some("lfs"));
+    }
+
     fn code_of(text: &str) -> Option<&'static str> {
         classify_remote_error(text).map(|(c, _)| c)
     }
@@ -1674,6 +2396,18 @@ mod tests {
         );
         assert_eq!(code_of("Host key verification failed."), Some("host_key"));
         assert_eq!(
+            code_of("git: 'lfs' is not a git command. See 'git --help'."),
+            Some("lfs_missing")
+        );
+        assert_eq!(
+            code_of("This repository is configured for Git LFS but 'git-lfs' was not found on your path."),
+            Some("lfs_missing")
+        );
+        assert_ne!(
+            code_of("batch response: Repository or object not found: https://host/x.git/info/lfs"),
+            Some("lfs_missing")
+        );
+        assert_eq!(
             code_of("fatal: repository 'https://host/x.git' not found"),
             Some("repo_not_found")
         );
@@ -1686,6 +2420,59 @@ mod tests {
             Some("network")
         );
         assert_eq!(code_of("Everything up to date, no error"), None);
+    }
+
+    #[test]
+    fn the_server_cannot_choose_a_way_out() {
+        // Sideband text naming a LOCAL cause stays unclassified …
+        for spoof in [
+            "remote: fatal: Unable to create '.git/index.lock': File exists.",
+            "remote: detected dubious ownership in repository",
+            "remote: fatal: couldn't find remote ref main",
+            "remote: error: filename too long",
+            "remote: error: Your local changes would be overwritten by merge",
+            "remote: SSL certificate problem: self signed certificate",
+        ] {
+            assert_eq!(code_of(spoof), None, "{spoof}");
+        }
+        // … while the server's own verdicts still count.
+        assert_eq!(
+            code_of("remote: GitLab: You are not allowed to push code to protected branches"),
+            Some("forbidden")
+        );
+        assert_eq!(
+            code_of("remote: Repository not found."),
+            Some("repo_not_found")
+        );
+        // git's own line still decides.
+        assert_eq!(
+            code_of("fatal: couldn't find remote ref main"),
+            Some("upstream_gone")
+        );
+    }
+
+    #[test]
+    fn locks_permissions_and_windows_certificates() {
+        assert_eq!(
+            code_of("fatal: Unable to create 'C:/r/.git/index.lock': File exists."),
+            Some("index_locked")
+        );
+        // No leftover lock: the folder refuses writing.
+        assert_eq!(
+            code_of("fatal: Unable to create '/r/.git/index.lock': Permission denied"),
+            Some("io_error")
+        );
+        assert_eq!(
+            code_of("fatal: unable to access '/r/.git/config': Permission denied"),
+            Some("io_error")
+        );
+        assert_eq!(
+            code_of(
+                "fatal: unable to access 'https://h/x.git/': schannel: CertGetCertificateChain \
+                 trust error CERT_TRUST_IS_UNTRUSTED_ROOT"
+            ),
+            Some("tls_cert")
+        );
     }
 
     #[test]

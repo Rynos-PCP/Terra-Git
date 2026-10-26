@@ -6,7 +6,7 @@
 use tauri::{AppHandle, Manager};
 
 use tg_domain::{RepoOpState, ResetMode, UndoAction, UndoEntry};
-use tg_git_engine::{error::GitEngineError, Git2Engine, GitEngine};
+use tg_git_engine::{error::GitEngineError, prelude::*, Git2Engine, GitEngine};
 
 use crate::commands::{blocking, CmdResult};
 use crate::undo::UndoState;
@@ -82,14 +82,82 @@ fn record_reset(
 /// and falsify the before/after comparison. Pure and blocking, so the logic
 /// stays testable without a Tauri runtime.
 type Snapshot = Option<(String, String)>;
-fn run_with_snapshots<F>(path: &str, f: F) -> Result<(String, Snapshot, Snapshot), GitEngineError>
+
+/// HEAD before and after an operation: the branch + tip, or — while the
+/// branch has no commit yet — just the branch it points at.
+struct Snapshots {
+    before: Snapshot,
+    after: Snapshot,
+    unborn_before: Option<String>,
+    unborn_after: Option<String>,
+}
+
+fn unborn_branch_sync(path: &str) -> Option<String> {
+    Git2Engine
+        .unborn_branch(std::path::Path::new(path))
+        .ok()
+        .flatten()
+}
+
+fn run_with_snapshots<F>(path: &str, f: F) -> Result<(String, Snapshots), GitEngineError>
 where
     F: FnOnce() -> Result<String, GitEngineError>,
 {
     let before = head_snapshot_sync(path);
+    let unborn_before = unborn_branch_sync(path);
     let result = f()?;
     let after = head_snapshot_sync(path);
-    Ok((result, before, after))
+    let unborn_after = unborn_branch_sync(path);
+    Ok((
+        result,
+        Snapshots {
+            before,
+            after,
+            unborn_before,
+            unborn_after,
+        },
+    ))
+}
+
+/// The very first commit on a branch and its undo: one side of
+/// the move has no commit at all, so there is no tip to reset to — the branch
+/// ref itself comes and goes.
+fn record_root(app: &AppHandle, path: &str, op: &str, detail: Option<String>, s: &Snapshots) {
+    let (undo, redo) = match (&s.before, &s.after) {
+        // Commit on an unborn branch: undo empties it again.
+        (None, Some((branch, id))) if s.unborn_before.as_deref() == Some(branch) => (
+            UndoAction::UncommitRoot {
+                branch: branch.clone(),
+                commit: id.clone(),
+            },
+            UndoAction::RecreateBranch {
+                name: branch.clone(),
+                commit: id.clone(),
+            },
+        ),
+        // The first commit taken back: undo brings the branch back.
+        (Some((branch, id)), None) if s.unborn_after.as_deref() == Some(branch) => (
+            UndoAction::RecreateBranch {
+                name: branch.clone(),
+                commit: id.clone(),
+            },
+            UndoAction::UncommitRoot {
+                branch: branch.clone(),
+                commit: id.clone(),
+            },
+        ),
+        _ => return,
+    };
+    app.state::<UndoState>().push(
+        path,
+        UndoEntry {
+            op: op.into(),
+            detail,
+            timestamp: now_ts(),
+            undo,
+            redo,
+        },
+    );
 }
 
 /// Runs an engine operation and records the HEAD movement as an undo entry
@@ -109,10 +177,11 @@ where
     F: FnOnce() -> Result<String, GitEngineError> + Send + 'static,
 {
     let p = path.to_string();
-    let (result, before, after) =
+    let (result, snaps) =
         blocking(move || crate::commands::with_index_lock(|| run_with_snapshots(&p, f))).await?;
-    if let (Some(b), Some(a)) = (before, after) {
-        record_reset(app, path, op, detail, b, a, mode);
+    match (&snaps.before, &snaps.after) {
+        (Some(b), Some(a)) => record_reset(app, path, op, detail, b.clone(), a.clone(), mode),
+        _ => record_root(app, path, op, detail, &snaps),
     }
     Ok(result)
 }
@@ -185,17 +254,51 @@ mod tests {
         let first = Git2Engine.commit(path, "First", false).unwrap();
 
         let p = path.to_string_lossy().into_owned();
-        let (result, before, after) = run_with_snapshots(&p, || {
+        let (result, snaps) = run_with_snapshots(&p, || {
             std::fs::write(path.join("a.txt"), "two\n")?;
             Git2Engine.stage(path, &["a.txt".to_string()])?;
             Git2Engine.commit(path, "Second", false)
         })
         .unwrap();
 
-        let (b_branch, b_id) = before.expect("before snapshot present");
-        let (a_branch, a_id) = after.expect("after snapshot present");
+        let (b_branch, b_id) = snaps.before.expect("before snapshot present");
+        let (a_branch, a_id) = snaps.after.expect("after snapshot present");
         assert_eq!(b_id, first, "before = state BEFORE the mutation");
         assert_eq!(a_id, result, "after = new HEAD AFTER the mutation");
         assert_eq!(b_branch, a_branch, "same branch before/after");
+    }
+
+    /// The first commit and its undo are visible to the recording — one
+    /// side has no tip, but the branch HEAD points at is known.
+    #[test]
+    fn snapshots_see_the_unborn_branch_around_the_first_commit() {
+        use tg_git_engine::prelude::*;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path();
+        Git2Engine.init_repo(path).unwrap();
+        for (k, v) in [
+            ("user.name", "T"),
+            ("user.email", "t@t.local"),
+            ("commit.gpgsign", "false"),
+        ] {
+            Git2Engine.config_set(path, k, v, false).unwrap();
+        }
+        std::fs::write(path.join("a.txt"), "one\n").unwrap();
+        Git2Engine.stage(path, &["a.txt".to_string()]).unwrap();
+
+        let p = path.to_string_lossy().into_owned();
+        let (id, snaps) =
+            run_with_snapshots(&p, || Git2Engine.commit(path, "First", false)).unwrap();
+        assert!(snaps.before.is_none());
+        let branch = snaps.unborn_before.clone().expect("unborn branch before");
+        assert_eq!(snaps.after, Some((branch.clone(), id.clone())));
+
+        let (_, snaps) = run_with_snapshots(&p, || {
+            Git2Engine.undo_last_commit(path).map(|_| String::new())
+        })
+        .unwrap();
+        assert_eq!(snaps.before, Some((branch.clone(), id)));
+        assert!(snaps.after.is_none());
+        assert_eq!(snaps.unborn_after, Some(branch));
     }
 }

@@ -174,6 +174,69 @@ fn stash_push_list_apply_drop() {
     assert!(engine.stash_list(&path).unwrap().is_empty());
 }
 
+/// The case "bring changes along" runs into: the stash conflicts with the commit
+/// it is applied onto, on a CLEAN worktree. libgit2 then writes the conflict
+/// markers and reports success — a plain `git_stash_pop` would drop the stash
+/// right after. The stash has to survive until the conflicts are resolved.
+#[test]
+fn stash_pop_with_conflict_keeps_the_stash() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+
+    write(&path, "a.txt", "mine\n");
+    engine.stash_push(&path, "WIP conflict", &[]).unwrap();
+    write(&path, "a.txt", "theirs\n");
+    commit_all(&path, "Theirs");
+
+    let outcome = engine.stash_pop(&path, 0).unwrap();
+    assert_eq!(outcome.conflicted, vec!["a.txt".to_string()]);
+    assert!(!outcome.dropped, "a conflicted pop must not drop the stash");
+    let stashes = engine.stash_list(&path).unwrap();
+    assert_eq!(stashes.len(), 1, "the stash has to survive the conflict");
+    assert!(stashes[0].message.contains("WIP conflict"));
+    let content = fs::read_to_string(path.join("a.txt")).unwrap();
+    assert!(
+        content.contains("<<<<<<<"),
+        "conflict markers expected: {content}"
+    );
+}
+
+#[test]
+fn stash_pop_without_conflict_drops_and_reports_it() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+
+    write(&path, "a.txt", "mine\n");
+    engine.stash_push(&path, "WIP clean", &[]).unwrap();
+
+    let outcome = engine.stash_pop(&path, 0).unwrap();
+    assert!(outcome.conflicted.is_empty());
+    assert!(outcome.dropped);
+    assert!(engine.stash_list(&path).unwrap().is_empty());
+}
+
+#[test]
+fn stash_apply_with_conflict_reports_the_files() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+
+    write(&path, "a.txt", "mine\n");
+    engine.stash_push(&path, "WIP apply", &[]).unwrap();
+    write(&path, "a.txt", "theirs\n");
+    commit_all(&path, "Theirs");
+
+    let outcome = engine.stash_apply(&path, 0).unwrap();
+    assert_eq!(outcome.conflicted, vec!["a.txt".to_string()]);
+    assert!(!outcome.dropped, "apply never drops");
+    assert_eq!(engine.stash_list(&path).unwrap().len(), 1);
+}
+
 #[test]
 fn stash_partial_only_selected_file() {
     let (_g, path) = init_repo();
@@ -716,6 +779,33 @@ fn init_ignore_remotes_and_config() {
 }
 
 /// Regression test for "the email is not being saved": empty values have to
+/// Only the keys the app writes are settable — the denylist alone missed
+/// `submodule.<n>.update = !cmd`, `core.worktree` and `safe.directory`.
+#[test]
+fn config_set_takes_only_the_keys_the_app_writes() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    for key in [
+        "user.name",
+        "USER.EMAIL",
+        "commit.gpgsign",
+        "core.longpaths",
+    ] {
+        engine.config_set(&path, key, "x", false).unwrap();
+    }
+    for key in [
+        "submodule.lib.update",
+        "core.worktree",
+        "safe.directory",
+        "pull.rebase",
+    ] {
+        assert!(
+            engine.config_set(&path, key, "x", false).is_err(),
+            "{key} must be refused"
+        );
+    }
+}
+
 /// REMOVE the config entry. An empty local entry (`email =`) otherwise masks any
 /// global value invisibly — which is exactly what happened to the user.
 #[test]
@@ -2783,4 +2873,1406 @@ fn repo_sketch_unborn_head_is_empty_and_window_caps() {
     assert_eq!(sketch.branches.len(), 1);
     assert_eq!(sketch.branches[0].base_index, None);
     assert_eq!(sketch.branches[0].ahead, 0);
+}
+
+// --- Recoverable discard ---
+
+fn read(root: &Path, rel: &str) -> Option<String> {
+    fs::read_to_string(root.join(rel)).ok()
+}
+
+#[test]
+fn discard_protected_restores_modified_new_and_deleted_files() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    write(&path, "gone.txt", "keep me\n");
+    commit_all(&path, "Base");
+
+    write(&path, "a.txt", "my work\n");
+    write(&path, "new.txt", "brand new\n");
+    write(&path, "dir/inner.txt", "nested\n");
+    fs::remove_file(path.join("gone.txt")).unwrap();
+
+    let files: Vec<String> = ["a.txt", "new.txt", "dir/inner.txt", "gone.txt"]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    let name = engine.discard_protected(&path, &files, 1 << 30).unwrap();
+    assert!(name.starts_with("files-"));
+
+    // The discard itself behaves as before.
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("base\n"));
+    assert!(!path.join("new.txt").exists());
+    assert!(!path.join("dir").join("inner.txt").exists());
+    assert_eq!(read(&path, "gone.txt").as_deref(), Some("keep me\n"));
+
+    let list = engine.discarded(&path).unwrap();
+    assert_eq!(list.len(), 1);
+    assert_eq!(list[0].kind, "files");
+    assert_eq!(
+        list[0].files,
+        vec!["a.txt", "dir/inner.txt", "gone.txt", "new.txt"]
+    );
+
+    engine
+        .restore_discarded(&path, &name, false, 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("my work\n"));
+    assert_eq!(read(&path, "new.txt").as_deref(), Some("brand new\n"));
+    assert_eq!(read(&path, "dir/inner.txt").as_deref(), Some("nested\n"));
+    assert!(
+        !path.join("gone.txt").exists(),
+        "the deletion comes back too"
+    );
+}
+
+#[test]
+fn discard_protected_does_not_overwrite_later_changes() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+
+    write(&path, "a.txt", "first try\n");
+    let name = engine
+        .discard_protected(&path, &["a.txt".into()], 1 << 30)
+        .unwrap();
+    write(&path, "a.txt", "second try\n");
+
+    let err = engine
+        .restore_discarded(&path, &name, false, 1 << 30)
+        .unwrap_err();
+    assert_eq!(err.code(), "discard_restore_conflict");
+    assert_eq!(err.to_string(), "a.txt");
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("second try\n"));
+
+    engine
+        .restore_discarded(&path, &name, true, 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("first try\n"));
+
+    // Even the forced overwrite is recoverable: "second try" is snapshotted.
+    let list = engine.discarded(&path).unwrap();
+    let guard = list
+        .iter()
+        .find(|d| d.kind == "overwrite")
+        .expect("overwrite snapshot");
+    assert_eq!(guard.files, vec!["a.txt"]);
+    engine
+        .restore_discarded(&path, &guard.name, false, 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("second try\n"));
+}
+
+#[test]
+fn discard_hunk_protected_restores_the_whole_file() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    let base: String = (1..=40).map(|i| format!("line {i}\n")).collect();
+    write(&path, "a.txt", &base);
+    commit_all(&path, "Base");
+
+    let edited = base
+        .replace("line 3\n", "LINE 3 NEW\n")
+        .replace("line 36\n", "LINE 36\n");
+    write(&path, "a.txt", &edited);
+
+    let name = engine
+        .discard_hunk_protected(&path, "a.txt", 1, 1 << 30)
+        .unwrap();
+    assert!(name.starts_with("hunk-"));
+    let after = read(&path, "a.txt").unwrap();
+    assert!(after.contains("line 36") && after.contains("LINE 3 NEW"));
+
+    engine
+        .restore_discarded(&path, &name, false, 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").unwrap(), edited);
+}
+
+#[test]
+fn discard_undo_and_redo_through_the_undo_executor() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    write(&path, "a.txt", "work\n");
+
+    let reference = engine
+        .discard_protected(&path, &["a.txt".into()], 1 << 30)
+        .unwrap();
+    engine
+        .apply_undo_action(
+            &path,
+            &UndoAction::RestoreDiscarded {
+                reference: reference.clone(),
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("work\n"));
+
+    engine
+        .apply_undo_action(&path, &UndoAction::ReapplyDiscarded { reference }, None)
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("base\n"));
+}
+
+#[test]
+fn discard_snapshot_works_without_a_git_identity() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    {
+        let repo = git2::Repository::open(&path).unwrap();
+        let mut config = repo.config().unwrap();
+        config.remove("user.name").unwrap();
+        config.remove("user.email").unwrap();
+    }
+    write(&path, "a.txt", "work\n");
+    engine
+        .discard_protected(&path, &["a.txt".into()], 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("base\n"));
+}
+
+#[test]
+fn discarded_snapshots_can_be_deleted_but_only_our_own() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    write(&path, "a.txt", "work\n");
+    let name = engine
+        .discard_protected(&path, &["a.txt".into()], 1 << 30)
+        .unwrap();
+
+    assert!(engine.delete_discarded(&path, "../../HEAD").is_err());
+    assert!(engine.delete_discarded(&path, "refs/heads/main").is_err());
+    engine.delete_discarded(&path, &name).unwrap();
+    assert!(engine.discarded(&path).unwrap().is_empty());
+}
+
+// --- Large change sets (user report 2026-10-13: staging ~25k files froze) ---
+
+#[test]
+fn stage_with_progress_stages_large_sets_with_a_counter() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    for i in 0..300 {
+        write(&path, &format!("old/f{i}.txt"), "base\n");
+    }
+    commit_all(&path, "Base");
+
+    // Modified, deleted and new files, plus names a glob would misread.
+    for i in 0..300 {
+        let f = format!("old/f{i}.txt");
+        if i < 150 {
+            write(&path, &f, "changed\n");
+        } else {
+            fs::remove_file(path.join(&f)).unwrap();
+        }
+    }
+    for i in 0..1200 {
+        write(&path, &format!("new/n{i}.txt"), &format!("new {i}\n"));
+    }
+    write(&path, "new/a[b].txt", "bracket\n");
+    write(&path, "new/ab.txt", "plain\n");
+    write(&path, "new/mit Ümlaut.txt", "umlaut\n");
+
+    let files: Vec<String> = engine
+        .status(&path)
+        .unwrap()
+        .unstaged
+        .iter()
+        .map(|e| e.path.clone())
+        .collect();
+    let mut events = Vec::new();
+    let token = tg_git_engine::CancelToken::new();
+    engine
+        .stage_with_progress(&path, &files, &token, &mut |p| events.push(p))
+        .unwrap();
+
+    let st = engine.status(&path).unwrap();
+    assert!(st.unstaged.is_empty(), "left unstaged: {:?}", st.unstaged);
+    assert_eq!(st.staged.len(), files.len());
+    let last = events.last().expect("progress events");
+    assert_eq!(last.phase, "staging");
+    assert_eq!(last.done, last.total);
+    assert_eq!(last.percent, 100);
+    assert!(events.windows(2).all(|w| w[0].done <= w[1].done));
+}
+
+#[test]
+fn stage_with_progress_respects_a_cancel() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "keep.txt", "base\n");
+    commit_all(&path, "Base");
+    for i in 0..400 {
+        write(&path, &format!("n{i}.txt"), "x\n");
+    }
+    let files: Vec<String> = (0..400).map(|i| format!("n{i}.txt")).collect();
+    let token = tg_git_engine::CancelToken::new();
+    token.cancel();
+
+    let err = engine
+        .stage_with_progress(&path, &files, &token, &mut |_| {})
+        .unwrap_err();
+    assert_eq!(err.code(), "cancelled");
+    assert!(engine.status(&path).unwrap().staged.is_empty());
+    // The killed git must not leave its lock behind (Windows keeps it).
+    assert!(!path.join(".git").join("index.lock").exists());
+}
+
+#[test]
+fn discarding_a_large_set_counts_the_files_and_stays_restorable() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    for i in 0..250 {
+        write(
+            &path,
+            &format!("f{i}.txt"),
+            "base
+",
+        );
+    }
+    commit_all(&path, "Base");
+    for i in 0..250 {
+        write(
+            &path,
+            &format!("f{i}.txt"),
+            "changed
+",
+        );
+    }
+    let files: Vec<String> = (0..250).map(|i| format!("f{i}.txt")).collect();
+    let mut events = Vec::new();
+    let name = engine
+        .discard_protected_with_progress(
+            &path,
+            &files,
+            50 * 1024 * 1024,
+            &tg_git_engine::CancelToken::new(),
+            &mut |p| events.push(p),
+        )
+        .unwrap();
+
+    assert!(engine.status(&path).unwrap().unstaged.is_empty());
+    let phases: Vec<&str> = events.iter().map(|e| e.phase.as_str()).collect();
+    assert_eq!(phases.first(), Some(&"backup"));
+    assert_eq!(phases.last(), Some(&"discarding"));
+    let last = events.last().unwrap();
+    assert_eq!(
+        (last.done, last.total, last.percent),
+        (Some(250), Some(250), 100)
+    );
+    // The copy is complete: restoring brings every change back.
+    engine
+        .restore_discarded(&path, &name, false, 50 * 1024 * 1024)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(path.join("f249.txt")).unwrap(),
+        "changed
+"
+    );
+}
+
+#[test]
+fn a_cancelled_large_discard_discards_nothing_and_leaves_no_copy() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    for i in 0..250 {
+        write(
+            &path,
+            &format!("f{i}.txt"),
+            "base
+",
+        );
+    }
+    commit_all(&path, "Base");
+    for i in 0..250 {
+        write(
+            &path,
+            &format!("f{i}.txt"),
+            "changed
+",
+        );
+    }
+    let files: Vec<String> = (0..250).map(|i| format!("f{i}.txt")).collect();
+    let token = tg_git_engine::CancelToken::new();
+    token.cancel();
+
+    let err = engine
+        .discard_protected_with_progress(&path, &files, 50 * 1024 * 1024, &token, &mut |_| {})
+        .unwrap_err();
+
+    assert_eq!(err.code(), "cancelled");
+    assert_eq!(
+        engine.status(&path).unwrap().unstaged.len(),
+        250,
+        "nothing discarded"
+    );
+    assert!(
+        engine.discarded(&path).unwrap().is_empty(),
+        "no half copy left"
+    );
+}
+
+#[test]
+fn rename_detection_is_skipped_beyond_the_budget() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    for i in 0..500 {
+        write(&path, &format!("a/f{i}.txt"), &format!("old content {i}\n"));
+    }
+    commit_all(&path, "Base");
+    // 501 new × 500 deleted = 250,500 candidate pairs > 250,000. Moved with
+    // identical content, so detection WOULD pair them all.
+    for i in 0..500 {
+        fs::rename(path.join(format!("a/f{i}.txt")), {
+            fs::create_dir_all(path.join("b")).unwrap();
+            path.join(format!("b/f{i}.txt"))
+        })
+        .unwrap();
+    }
+    write(&path, "b/extra.txt", "extra\n");
+
+    let st = engine.status(&path).unwrap();
+    assert!(st.unstaged.iter().all(|e| e.kind != ChangeKind::Renamed));
+    assert_eq!(st.unstaged.len(), 1001);
+}
+
+#[test]
+fn rename_detection_still_runs_within_the_budget() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "same content\nover several lines\n");
+    commit_all(&path, "Base");
+    fs::rename(path.join("a.txt"), path.join("b.txt")).unwrap();
+
+    let st = engine.status(&path).unwrap();
+    assert_eq!(st.unstaged.len(), 1);
+    assert_eq!(st.unstaged[0].kind, ChangeKind::Renamed);
+}
+
+// --- Storage limit of the discard store (user wish 2026-10-13) ---
+
+fn store_dir(path: &Path) -> PathBuf {
+    path.join(".git").join("terra-git").join("discarded")
+}
+
+#[test]
+fn discard_of_a_tracked_file_does_not_copy_what_git_already_holds() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    let base = "base content that git already stores\n".repeat(50);
+    write(&path, "a.txt", &base);
+    commit_all(&path, "Base");
+    write(&path, "a.txt", "w\n");
+
+    let name = engine
+        .discard_protected(&path, &["a.txt".into()], 1 << 30)
+        .unwrap();
+    // The "after" state is the committed version: no copy of it in the store.
+    assert!(!store_dir(&path).join(&name).join("a0").exists());
+    let size = engine.discarded(&path).unwrap()[0].size;
+    assert!(
+        size < base.len() as u64,
+        "size {size} must not include the base"
+    );
+
+    // Redo still works — it reads the after state from git's objects.
+    engine
+        .restore_discarded(&path, &name, false, 1 << 30)
+        .unwrap();
+    engine
+        .apply_undo_action(
+            &path,
+            &UndoAction::ReapplyDiscarded { reference: name },
+            None,
+        )
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").unwrap(), base);
+}
+
+#[test]
+fn a_full_store_blocks_the_discard_and_touches_nothing() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+
+    write(&path, "a.txt", &"first ".repeat(40));
+    engine
+        .discard_protected(&path, &["a.txt".into()], 600)
+        .unwrap();
+    let used = engine.discarded(&path).unwrap()[0].size;
+
+    write(&path, "a.txt", &"second ".repeat(50));
+    let err = engine
+        .discard_protected(&path, &["a.txt".into()], 600)
+        .unwrap_err();
+    assert_eq!(err.code(), "discard_store_full");
+    // The worktree file plus the index version it goes back to (5 bytes).
+    assert_eq!(err.to_string(), format!("{} {used} 600", 7 * 50 + 5));
+    // Nothing discarded, nothing deleted to make room.
+    assert_eq!(read(&path, "a.txt").unwrap(), "second ".repeat(50));
+    assert_eq!(engine.discarded(&path).unwrap().len(), 1);
+
+    // Room made by the user: the same discard goes through.
+    let first = engine.discarded(&path).unwrap()[0].name.clone();
+    engine.delete_discarded(&path, &first).unwrap();
+    engine
+        .discard_protected(&path, &["a.txt".into()], 600)
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("base\n"));
+}
+
+#[test]
+fn a_discard_larger_than_the_whole_limit_is_refused() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "small.txt", "s\n");
+    write(&path, "big.txt", "b\n");
+    commit_all(&path, "Base");
+    write(&path, "small.txt", "small change\n");
+    write(&path, "big.txt", &"B".repeat(5000));
+
+    let err = engine
+        .discard_protected(&path, &["big.txt".into(), "small.txt".into()], 1000)
+        .unwrap_err();
+    assert_eq!(err.code(), "discard_store_full");
+    // ALL files count — none is left out silently.
+    // Both worktree files, plus the index versions they go back to.
+    assert_eq!(err.to_string(), format!("{} 0 1000", 5000 + 13 + 2 + 2));
+    assert_eq!(read(&path, "big.txt").unwrap().len(), 5000);
+    assert_eq!(read(&path, "small.txt").as_deref(), Some("small change\n"));
+}
+
+#[test]
+fn nothing_is_deleted_automatically() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    for round in 0..60 {
+        write(&path, "a.txt", &format!("work {round}\n"));
+        engine
+            .discard_protected(&path, &["a.txt".into()], 1 << 30)
+            .unwrap();
+    }
+    // No count cap either: every copy stays until the user deletes it.
+    assert_eq!(engine.discarded(&path).unwrap().len(), 60);
+    assert_eq!(fs::read_dir(store_dir(&path)).unwrap().count(), 60);
+}
+
+#[test]
+fn a_forced_restore_is_refused_when_its_safety_copy_does_not_fit() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    write(&path, "a.txt", "first\n");
+    let name = engine
+        .discard_protected(&path, &["a.txt".into()], 1 << 30)
+        .unwrap();
+    write(&path, "a.txt", &"later work ".repeat(100));
+    let used: u64 = engine
+        .discarded(&path)
+        .unwrap()
+        .iter()
+        .map(|d| d.size)
+        .sum();
+
+    let err = engine
+        .restore_discarded(&path, &name, true, used + 10)
+        .unwrap_err();
+    assert_eq!(err.code(), "discard_store_full");
+    assert_eq!(read(&path, "a.txt").unwrap(), "later work ".repeat(100));
+}
+
+// --- The root commit can be changed and taken back ---
+
+#[test]
+fn undoing_the_first_commit_leaves_an_empty_branch_with_everything_staged() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "a\n");
+    write(&path, "dir/b.txt", "b\n");
+    let first = commit_all(&path, "First");
+    let branch = current_branch(&engine, &path);
+
+    engine.undo_last_commit(&path).unwrap();
+
+    assert_eq!(engine.unborn_branch(&path).unwrap(), Some(branch));
+    let st = engine.status(&path).unwrap();
+    let mut staged: Vec<&str> = st.staged.iter().map(|e| e.path.as_str()).collect();
+    staged.sort();
+    assert_eq!(staged, vec!["a.txt", "dir/b.txt"]);
+    assert!(st.staged.iter().all(|e| e.kind == ChangeKind::Added));
+    assert!(st.unstaged.is_empty(), "the worktree is untouched");
+    // A backup points at the commit taken back.
+    assert!(engine
+        .backups(&path)
+        .unwrap()
+        .iter()
+        .any(|b| b.target_id == first));
+}
+
+#[test]
+fn the_first_commit_round_trips_through_the_undo_executor() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "a\n");
+    let first = commit_all(&path, "First");
+    let branch = current_branch(&engine, &path);
+
+    engine
+        .apply_undo_action(
+            &path,
+            &UndoAction::UncommitRoot {
+                branch: branch.clone(),
+                commit: first.clone(),
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(engine.unborn_branch(&path).unwrap(), Some(branch.clone()));
+
+    engine
+        .apply_undo_action(
+            &path,
+            &UndoAction::RecreateBranch {
+                name: branch.clone(),
+                commit: first.clone(),
+            },
+            None,
+        )
+        .unwrap();
+    assert_eq!(engine.log(&path, 0, 5).unwrap()[0].id, first);
+    assert!(engine.status(&path).unwrap().staged.is_empty());
+}
+
+#[test]
+fn uncommit_root_refuses_when_the_branch_moved_on() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "a\n");
+    let first = commit_all(&path, "First");
+    write(&path, "b.txt", "b\n");
+    commit_all(&path, "Second");
+    let branch = current_branch(&engine, &path);
+
+    let err = engine
+        .apply_undo_action(
+            &path,
+            &UndoAction::UncommitRoot {
+                branch,
+                commit: first,
+            },
+            None,
+        )
+        .unwrap_err();
+    assert_eq!(err.code(), "undo_stale");
+    assert_eq!(engine.log(&path, 0, 5).unwrap().len(), 2);
+}
+
+#[test]
+fn interactive_rebase_from_the_root_rewords_the_first_commit() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "1\n");
+    let root = commit_all(&path, "old root message");
+    write(&path, "b.txt", "2\n");
+    let second = commit_all(&path, "Second");
+
+    let steps = vec![
+        RebaseStep {
+            action: "reword".into(),
+            commit_id: root,
+            message: Some("new root message".into()),
+            author: None,
+        },
+        step("pick", &second),
+    ];
+    engine.rebase_interactive(&path, "", &steps).unwrap();
+
+    assert_eq!(summaries(&path), vec!["Second", "new root message"]);
+    assert_eq!(engine.op_state(&path).unwrap(), RepoOpState::Clean);
+}
+
+#[test]
+fn interactive_rebase_from_the_root_can_reorder_and_drop() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "a\n");
+    let c1 = commit_all(&path, "C1");
+    write(&path, "b.txt", "b\n");
+    let c2 = commit_all(&path, "C2");
+    write(&path, "c.txt", "c\n");
+    let c3 = commit_all(&path, "C3");
+
+    let steps = [step("pick", &c2), step("pick", &c1), step("drop", &c3)];
+    engine.rebase_interactive(&path, "", &steps).unwrap();
+
+    assert_eq!(summaries(&path), vec!["C1", "C2"]);
+    assert!(!path.join("c.txt").exists());
+}
+
+#[test]
+fn squashing_down_to_the_root_makes_one_new_root_commit() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "a\n");
+    let root = commit_all(&path, "C1");
+    write(&path, "b.txt", "b\n");
+    commit_all(&path, "C2");
+    write(&path, "a.txt", "a2\n");
+    let head = commit_all(&path, "C3");
+    let head_tree = git2::Repository::open(&path)
+        .unwrap()
+        .find_commit(git2::Oid::from_str(&head).unwrap())
+        .unwrap()
+        .tree_id();
+
+    let id = engine.squash_from(&path, &root, "All in one").unwrap();
+
+    let log = engine.log(&path, 0, 10).unwrap();
+    assert_eq!(log.len(), 1);
+    assert_eq!(log[0].id, id);
+    assert_eq!(log[0].summary, "All in one");
+    let repo = git2::Repository::open(&path).unwrap();
+    let new = repo.find_commit(git2::Oid::from_str(&id).unwrap()).unwrap();
+    assert_eq!(new.parent_count(), 0, "a new root commit");
+    assert_eq!(new.tree_id(), head_tree, "same content as before");
+    assert!(engine.status(&path).unwrap().staged.is_empty());
+}
+
+#[test]
+fn squashing_only_the_root_itself_is_refused() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "a\n");
+    let root = commit_all(&path, "Only");
+
+    assert!(engine.squash_from(&path, &root, "x").is_err());
+    assert_eq!(engine.log(&path, 0, 5).unwrap()[0].id, root);
+}
+
+// --- The conflict workshop for every conflict ---
+
+/// The conflicting segment of a file, read like the workshop does.
+fn first_conflict(engine: &Git2Engine, path: &Path, file: &str) -> tg_domain::ConflictSegment {
+    engine
+        .read_conflict(path, file)
+        .unwrap()
+        .segments
+        .into_iter()
+        .find(|s| s.kind == "conflict")
+        .expect("a conflict segment")
+}
+
+#[test]
+fn a_merge_conflict_carries_the_base_whatever_the_config() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    let main = current_branch(&engine, &path);
+    engine.create_branch(&path, "side", true).unwrap();
+    write(&path, "a.txt", "side\n");
+    commit_all(&path, "Side");
+    engine.checkout_branch(&path, &main).unwrap();
+    write(&path, "a.txt", "main\n");
+    commit_all(&path, "Main");
+
+    assert!(engine.merge_branch(&path, "side").is_err());
+    let seg = first_conflict(&engine, &path, "a.txt");
+    assert_eq!(seg.ours, vec!["main"]);
+    assert_eq!(seg.theirs, vec!["side"]);
+    assert_eq!(seg.base, Some(vec!["base".to_string()]));
+}
+
+#[test]
+fn a_stash_conflict_carries_the_base_too() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    write(&path, "a.txt", "mine\n");
+    engine.stash_push(&path, "WIP", &[]).unwrap();
+    write(&path, "a.txt", "theirs\n");
+    commit_all(&path, "Theirs");
+
+    let outcome = engine.stash_pop(&path, 0).unwrap();
+    assert_eq!(outcome.conflicted, vec!["a.txt"]);
+    let seg = first_conflict(&engine, &path, "a.txt");
+    assert_eq!(seg.base, Some(vec!["base".to_string()]));
+    assert_eq!(
+        seg.ours,
+        vec!["theirs"],
+        "ours = the commit it was applied onto"
+    );
+    assert_eq!(seg.theirs, vec!["mine"], "theirs = the stashed change");
+}
+
+#[test]
+fn abandoning_stash_conflicts_restores_head_and_keeps_the_stash() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    write(&path, "a.txt", "mine\n");
+    write(&path, "new.txt", "stashed new file\n");
+    engine.stash_push(&path, "WIP", &[]).unwrap();
+    write(&path, "a.txt", "theirs\n");
+    commit_all(&path, "Theirs");
+    engine.stash_pop(&path, 0).unwrap();
+
+    let name = engine
+        .abandon_conflicts(&path, &["a.txt".into()], 1 << 30)
+        .unwrap();
+
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("theirs\n"));
+    let st = engine.status(&path).unwrap();
+    assert!(st.unstaged.iter().all(|e| e.kind != ChangeKind::Conflicted));
+    assert_eq!(
+        engine.stash_list(&path).unwrap().len(),
+        1,
+        "the stash stays"
+    );
+    // What was given up is recoverable.
+    assert!(engine
+        .discarded(&path)
+        .unwrap()
+        .iter()
+        .any(|d| d.name == name));
+}
+
+#[test]
+fn abandon_conflicts_refuses_during_a_running_operation() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    let main = current_branch(&engine, &path);
+    engine.create_branch(&path, "side", true).unwrap();
+    write(&path, "a.txt", "side\n");
+    commit_all(&path, "Side");
+    engine.checkout_branch(&path, &main).unwrap();
+    write(&path, "a.txt", "main\n");
+    commit_all(&path, "Main");
+    assert!(engine.merge_branch(&path, "side").is_err());
+
+    assert!(engine
+        .abandon_conflicts(&path, &["a.txt".into()], 1 << 30)
+        .is_err());
+    assert_eq!(engine.op_state(&path).unwrap(), RepoOpState::Merge);
+}
+
+// --- Sync flows ---
+
+/// A bare remote plus two clones that both committed on top of "Base": `work`
+/// is behind AND ahead (diverged). Returns (guards, work).
+fn diverged_clones() -> (Vec<tempfile::TempDir>, PathBuf) {
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare", "-q"]);
+    let url = file_url(remote.path());
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let work = work_dir.path().join("work");
+    git(work_dir.path(), &["clone", "-q", &url, "work"]);
+    for (k, v) in [
+        ("user.name", "W"),
+        ("user.email", "w@t"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&work, &["config", k, v]);
+    }
+    write(&work, "base.txt", "base\n");
+    commit_all(&work, "Base");
+    git(&work, &["push", "-q", "origin", "HEAD"]);
+
+    let other_dir = tempfile::tempdir().unwrap();
+    let other = other_dir.path().join("other");
+    git(other_dir.path(), &["clone", "-q", &url, "other"]);
+    for (k, v) in [
+        ("user.name", "O"),
+        ("user.email", "o@t"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&other, &["config", k, v]);
+    }
+    write(&other, "theirs.txt", "theirs\n");
+    git(&other, &["add", "-A"]);
+    git(&other, &["commit", "-q", "-m", "Theirs"]);
+    git(&other, &["push", "-q", "origin", "HEAD"]);
+
+    write(&work, "mine.txt", "mine\n");
+    commit_all(&work, "Mine");
+    (vec![remote, work_dir, other_dir], work)
+}
+
+fn pull(path: &Path, strategy: Option<&str>) -> tg_git_engine::error::Result<String> {
+    Git2Engine.pull_with_strategy(
+        path,
+        false,
+        strategy,
+        None,
+        &tg_git_engine::CancelToken::new(),
+        &mut |_| {},
+    )
+}
+
+#[test]
+fn pull_with_merge_strategy_creates_a_merge_commit() {
+    let (_g, work) = diverged_clones();
+    pull(&work, Some("merge")).unwrap();
+    let repo = git2::Repository::open(&work).unwrap();
+    let head = repo.head().unwrap().peel_to_commit().unwrap();
+    assert_eq!(head.parent_count(), 2);
+    assert!(work.join("theirs.txt").exists());
+}
+
+#[test]
+fn pull_with_rebase_strategy_keeps_history_linear() {
+    let (_g, work) = diverged_clones();
+    pull(&work, Some("rebase")).unwrap();
+    assert_eq!(summaries(&work), vec!["Mine", "Theirs", "Base"]);
+}
+
+#[test]
+fn pull_fast_forward_only_reports_divergence() {
+    let (_g, work) = diverged_clones();
+    let err = pull(&work, Some("ff-only")).unwrap_err();
+    assert_eq!(err.code(), "divergent", "{err}");
+}
+
+#[test]
+fn a_pull_strategy_set_in_git_wins_over_the_app() {
+    let (_g, work) = diverged_clones();
+    git(&work, &["config", "pull.rebase", "true"]);
+    pull(&work, Some("merge")).unwrap();
+    assert_eq!(
+        summaries(&work),
+        vec!["Mine", "Theirs", "Base"],
+        "rebased, not merged"
+    );
+}
+
+/// The answer in the "diverged" dialog overrides git's own pull settings —
+/// otherwise "Merge" with `pull.ff=only` led back into the same dialog, and
+/// "Rebase" with `pull.rebase=false` made a merge commit.
+#[test]
+fn an_explicit_choice_beats_the_pull_settings_in_git() {
+    let (_g, work) = diverged_clones();
+    git(&work, &["config", "pull.ff", "only"]);
+    assert_eq!(pull(&work, Some("merge")).unwrap_err().code(), "divergent");
+    pull(&work, Some("merge-chosen")).unwrap();
+    let repo = git2::Repository::open(&work).unwrap();
+    assert_eq!(
+        repo.head()
+            .unwrap()
+            .peel_to_commit()
+            .unwrap()
+            .parent_count(),
+        2
+    );
+
+    let (_g2, work) = diverged_clones();
+    git(&work, &["config", "pull.rebase", "false"]);
+    pull(&work, Some("rebase-chosen")).unwrap();
+    assert_eq!(summaries(&work), vec!["Mine", "Theirs", "Base"], "rebased");
+}
+
+#[test]
+fn pull_with_colliding_local_changes_is_classified() {
+    let (_g, work) = diverged_clones();
+    write(&work, "theirs.txt", "my own untracked version\n");
+    let err = pull(&work, Some("merge")).unwrap_err();
+    assert_eq!(err.code(), "local_changes_overwritten", "{err}");
+}
+
+#[test]
+fn merge_with_colliding_local_changes_is_classified() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "base\n");
+    commit_all(&path, "Base");
+    let main = current_branch(&engine, &path);
+    engine.create_branch(&path, "side", true).unwrap();
+    write(&path, "a.txt", "side\n");
+    commit_all(&path, "Side");
+    engine.checkout_branch(&path, &main).unwrap();
+    write(&path, "a.txt", "uncommitted\n");
+
+    let err = engine.merge_branch(&path, "side").unwrap_err();
+    assert_eq!(err.code(), "local_changes_overwritten", "{err}");
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("uncommitted\n"));
+}
+
+#[test]
+fn count_commits_and_default_branch() {
+    let (_g, work) = diverged_clones();
+    let engine = Git2Engine;
+    git(&work, &["fetch", "-q"]);
+    git(&work, &["remote", "set-head", "origin", "--auto"]);
+    let default = engine
+        .default_branch(&work)
+        .unwrap()
+        .expect("default branch");
+    assert!(default.starts_with("origin/"), "{default}");
+    assert_eq!(engine.count_commits(&work, "HEAD", &default).unwrap(), 1);
+    assert_eq!(engine.count_commits(&work, &default, "HEAD").unwrap(), 1);
+    assert_eq!(engine.count_commits(&work, "HEAD", "HEAD").unwrap(), 0);
+}
+
+// --- Remote choice and publishing ---
+
+/// A repo cloned from `origin` plus a second remote `mirror` (a bare copy that
+/// got one extra commit on the same branch).
+fn two_remotes() -> (Vec<tempfile::TempDir>, PathBuf, String) {
+    let origin = tempfile::tempdir().unwrap();
+    git(origin.path(), &["init", "--bare", "-q"]);
+    let origin_url = file_url(origin.path());
+
+    let work_dir = tempfile::tempdir().unwrap();
+    let work = work_dir.path().join("work");
+    git(work_dir.path(), &["clone", "-q", &origin_url, "work"]);
+    for (k, v) in [
+        ("user.name", "W"),
+        ("user.email", "w@t"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&work, &["config", k, v]);
+    }
+    write(&work, "base.txt", "base\n");
+    commit_all(&work, "Base");
+    git(&work, &["push", "-q", "origin", "HEAD"]);
+    let branch = current_branch(&Git2Engine, &work);
+
+    // The mirror: a bare clone of origin with one more commit on `branch`.
+    let mirror = tempfile::tempdir().unwrap();
+    git(
+        mirror.path().parent().unwrap(),
+        &[
+            "clone",
+            "-q",
+            "--bare",
+            &origin_url,
+            &mirror.path().to_string_lossy(),
+        ],
+    );
+    let helper_dir = tempfile::tempdir().unwrap();
+    let helper = helper_dir.path().join("h");
+    git(
+        helper_dir.path(),
+        &["clone", "-q", &file_url(mirror.path()), "h"],
+    );
+    for (k, v) in [
+        ("user.name", "M"),
+        ("user.email", "m@t"),
+        ("commit.gpgsign", "false"),
+    ] {
+        git(&helper, &["config", k, v]);
+    }
+    write(&helper, "mirror.txt", "from the mirror\n");
+    git(&helper, &["add", "-A"]);
+    git(&helper, &["commit", "-q", "-m", "Mirror only"]);
+    git(&helper, &["push", "-q", "origin", "HEAD"]);
+
+    git(
+        &work,
+        &["remote", "add", "mirror", &file_url(mirror.path())],
+    );
+    (vec![origin, work_dir, mirror, helper_dir], work, branch)
+}
+
+fn cancel() -> tg_git_engine::CancelToken {
+    tg_git_engine::CancelToken::new()
+}
+
+#[test]
+fn fetch_from_a_named_remote_and_from_all() {
+    let (_g, work, branch) = two_remotes();
+    let engine = Git2Engine;
+
+    engine
+        .fetch_from(&work, Some("mirror"), &cancel(), &mut |_| {})
+        .unwrap();
+    let repo = git2::Repository::open(&work).unwrap();
+    assert!(repo
+        .find_reference(&format!("refs/remotes/mirror/{branch}"))
+        .is_ok());
+
+    engine
+        .fetch_from(&work, None, &cancel(), &mut |_| {})
+        .unwrap();
+}
+
+#[test]
+fn fetch_refuses_an_option_as_remote_name() {
+    let (_g, work, _) = two_remotes();
+    let err = Git2Engine
+        .fetch_from(&work, Some("--upload-pack=evil"), &cancel(), &mut |_| {})
+        .unwrap_err();
+    // Refused before git runs at all (reject_remote_option).
+    assert!(err.to_string().contains("Invalid remote"), "{err}");
+}
+
+#[test]
+fn pull_from_a_non_origin_remote() {
+    let (_g, work, branch) = two_remotes();
+    Git2Engine
+        .pull_with_strategy(
+            &work,
+            false,
+            Some("merge"),
+            Some(("mirror", &branch)),
+            &cancel(),
+            &mut |_| {},
+        )
+        .unwrap();
+    assert!(work.join("mirror.txt").exists());
+    assert_eq!(summaries(&work)[0], "Mirror only");
+}
+
+#[test]
+fn publish_branch_only_pushes_the_fork_point_and_tracks_it() {
+    let (_g, work, branch) = two_remotes();
+    let engine = Git2Engine;
+    let base = engine.log(&work, 0, 1).unwrap()[0].id.clone();
+    engine.create_branch(&work, "feature/new", true).unwrap();
+    write(&work, "f1.txt", "1\n");
+    commit_all(&work, "F1");
+    write(&work, "f2.txt", "2\n");
+    commit_all(&work, "F2");
+
+    engine
+        .publish_branch_only(&work, "origin", &cancel(), &mut |_| {})
+        .unwrap();
+
+    let repo = git2::Repository::open(&work).unwrap();
+    let remote_tip = repo
+        .find_reference("refs/remotes/origin/feature/new")
+        .unwrap()
+        .peel_to_commit()
+        .unwrap()
+        .id()
+        .to_string();
+    assert_eq!(
+        remote_tip, base,
+        "the branch is published at its fork point"
+    );
+    let st = engine.status(&work).unwrap();
+    assert_eq!(st.upstream.as_deref(), Some("origin/feature/new"));
+    assert_eq!(st.ahead, 2, "the two commits are still to be pushed");
+    let _ = branch;
+}
+
+#[test]
+fn publish_branch_only_needs_a_commit_on_a_remote() {
+    let (_g, path) = init_repo();
+    write(&path, "a.txt", "a\n");
+    commit_all(&path, "Local only");
+    let remote = tempfile::tempdir().unwrap();
+    git(remote.path(), &["init", "--bare", "-q"]);
+    git(
+        &path,
+        &["remote", "add", "origin", &file_url(remote.path())],
+    );
+
+    let err = Git2Engine
+        .publish_branch_only(&path, "origin", &cancel(), &mut |_| {})
+        .unwrap_err();
+    assert_eq!(err.code(), "invalid_operation", "{err}");
+}
+
+// --- Reflog, reset, compare ---
+
+#[test]
+fn reflog_lists_the_steps_of_head_and_of_a_branch() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "1\n");
+    commit_all(&path, "One");
+    write(&path, "a.txt", "2\n");
+    let two = commit_all(&path, "Two");
+    let branch = current_branch(&engine, &path);
+
+    let head = engine.reflog(&path, "HEAD", 50).unwrap();
+    assert_eq!(head[0].id, two);
+    assert_eq!(head[0].summary.as_deref(), Some("Two"));
+    assert_eq!(head[0].index, 0);
+    assert!(!engine
+        .reflog(&path, &format!("refs/heads/{branch}"), 50)
+        .unwrap()
+        .is_empty());
+    assert!(engine.reflog(&path, "refs/tags/v1", 50).is_err());
+    // Only the prefix used to be checked; libgit2 builds .git/logs/<name>.
+    assert!(engine
+        .reflog(&path, "refs/heads/../../../../outside", 50)
+        .is_err());
+}
+
+fn three_commits(path: &Path) -> (String, String, String) {
+    write(path, "a.txt", "1\n");
+    let one = commit_all(path, "One");
+    write(path, "a.txt", "2\n");
+    let two = commit_all(path, "Two");
+    write(path, "b.txt", "3\n");
+    let three = commit_all(path, "Three");
+    (one, two, three)
+}
+
+#[test]
+fn reset_soft_keeps_the_changes_staged() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    let (one, _, _) = three_commits(&path);
+
+    engine
+        .reset_to(&path, &one, ResetMode::Soft, 1 << 30)
+        .unwrap();
+
+    assert_eq!(summaries(&path), vec!["One"]);
+    let st = engine.status(&path).unwrap();
+    assert_eq!(st.staged.len(), 2);
+    assert!(st.unstaged.is_empty());
+    assert!(engine
+        .backups(&path)
+        .unwrap()
+        .iter()
+        .any(|b| b.op == "reset"));
+}
+
+#[test]
+fn reset_mixed_turns_the_changes_into_unstaged_ones() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    let (one, _, _) = three_commits(&path);
+
+    engine
+        .reset_to(&path, &one, ResetMode::Mixed, 1 << 30)
+        .unwrap();
+
+    let st = engine.status(&path).unwrap();
+    assert!(st.staged.is_empty());
+    assert_eq!(st.unstaged.len(), 2);
+}
+
+#[test]
+fn reset_hard_copies_uncommitted_work_before_overwriting_it() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    let (one, _, _) = three_commits(&path);
+    write(&path, "a.txt", "uncommitted work\n");
+
+    let snapshot = engine
+        .reset_to(&path, &one, ResetMode::Hard, 1 << 30)
+        .unwrap()
+        .expect("a copy of the uncommitted work");
+
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("1\n"));
+    assert!(!path.join("b.txt").exists());
+    engine
+        .restore_discarded(&path, &snapshot, true, 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("uncommitted work\n"));
+}
+
+#[test]
+fn reset_hard_refuses_when_the_copy_does_not_fit() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    let (one, _, three) = three_commits(&path);
+    write(&path, "a.txt", &"x".repeat(5000));
+
+    let err = engine
+        .reset_to(&path, &one, ResetMode::Hard, 100)
+        .unwrap_err();
+    assert_eq!(err.code(), "discard_store_full");
+    assert_eq!(engine.log(&path, 0, 1).unwrap()[0].id, three);
+}
+
+#[test]
+fn compare_two_commits_log_range_diff_and_merge_base() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "base.txt", "base\n");
+    let base = commit_all(&path, "Base");
+    let main = current_branch(&engine, &path);
+    engine.create_branch(&path, "side", true).unwrap();
+    write(&path, "side.txt", "side\n");
+    commit_all(&path, "Side");
+    engine.checkout_branch(&path, &main).unwrap();
+    write(&path, "main.txt", "main\n");
+    commit_all(&path, "Main");
+
+    let only_side = engine.log_range(&path, &main, "side", 10).unwrap();
+    assert_eq!(only_side.len(), 1);
+    assert_eq!(only_side[0].summary, "Side");
+    assert_eq!(engine.merge_base(&path, &main, "side").unwrap(), base);
+
+    let mut files = Vec::new();
+    let total = engine
+        .range_diff_stream(&path, &base, "side", 100, &mut |fd| {
+            files.push(fd.path);
+            true
+        })
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(files, vec!["side.txt"]);
+}
+
+// --- Release audit 2026-10-25: data safety of discard, reset and history ---
+
+/// An untracked nested repository is never discarded: its copy could not be
+/// restored (no snapshot writes into a `.git`), and deleting it would take its
+/// history. The discard is refused before anything is touched.
+#[test]
+fn discard_refuses_a_nested_repository_and_touches_nothing() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "a\n");
+    commit_all(&path, "Base");
+    write(&path, "a.txt", "changed\n");
+    let nested = path.join("nested");
+    git2::Repository::init(&nested).unwrap();
+    write(&nested, "work.txt", "nested work\n");
+
+    let err = engine
+        .discard_protected(&path, &["a.txt".into(), "nested/".into()], 1 << 30)
+        .unwrap_err();
+    assert!(err.to_string().contains("nested"), "{err}");
+    assert_eq!(read(&path, "a.txt").as_deref(), Some("changed\n"));
+    assert!(nested.join(".git").exists());
+    assert_eq!(read(&nested, "work.txt").as_deref(), Some("nested work\n"));
+    assert!(engine.discarded(&path).unwrap().is_empty());
+}
+
+/// A hard reset replaces an untracked file at a path the target holds — the
+/// copy taken before must include it.
+#[test]
+fn reset_hard_copies_untracked_files_it_overwrites() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "notes.txt", "committed\n");
+    let first = commit_all(&path, "With notes");
+    git(&path, &["rm", "-q", "--cached", "notes.txt"]);
+    git(&path, &["commit", "-q", "-m", "Untrack notes"]);
+    write(&path, "notes.txt", "my edit\n");
+
+    let snapshot = engine
+        .reset_to(&path, &first, ResetMode::Hard, 1 << 30)
+        .unwrap()
+        .expect("a copy of the untracked file");
+    assert_eq!(read(&path, "notes.txt").as_deref(), Some("committed\n"));
+    engine
+        .restore_discarded(&path, &snapshot, true, 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "notes.txt").as_deref(), Some("my edit\n"));
+}
+
+/// Restoring a backup resets hard without a copy — so it refuses when that
+/// would overwrite an untracked file.
+#[test]
+fn restoring_a_backup_refuses_to_overwrite_untracked_files() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "notes.txt", "committed\n");
+    let first = commit_all(&path, "With notes");
+    engine
+        .reset_to(&path, &first, ResetMode::Soft, 1 << 30)
+        .unwrap();
+    let backup = engine
+        .backups(&path)
+        .unwrap()
+        .into_iter()
+        .find(|b| b.target_id == first)
+        .expect("backup of the first commit");
+    git(&path, &["rm", "-q", "--cached", "notes.txt"]);
+    git(&path, &["commit", "-q", "-m", "Untrack notes"]);
+    write(&path, "notes.txt", "my edit\n");
+
+    let err = engine.restore_backup(&path, &backup.name).unwrap_err();
+    assert!(err.to_string().contains("notes.txt"), "{err}");
+    assert_eq!(read(&path, "notes.txt").as_deref(), Some("my edit\n"));
+}
+
+/// Discarding `d/a` where a file `d` took the folder's place: the checkout
+/// removes that file, so the copy keeps it — and restoring brings it back.
+#[test]
+fn discard_keeps_a_copy_of_a_file_that_took_a_folders_place() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "d/a", "a\n");
+    write(&path, "d/b", "b\n");
+    commit_all(&path, "Folder");
+    fs::remove_dir_all(path.join("d")).unwrap();
+    write(&path, "d", "a file in the way\n");
+
+    let name = engine
+        .discard_protected(&path, &["d/a".into()], 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "d/a").as_deref(), Some("a\n"));
+    engine
+        .restore_discarded(&path, &name, false, 1 << 30)
+        .unwrap();
+    assert_eq!(read(&path, "d").as_deref(), Some("a file in the way\n"));
+}
+
+/// The squash commits the index — something unrelated staged on top would
+/// end up inside it. Refused, and nothing changes.
+#[test]
+fn squash_refuses_while_something_unrelated_is_staged() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    let (_, two, _) = three_commits(&path);
+    write(&path, "staged.txt", "unrelated\n");
+    engine.stage(&path, &["staged.txt".into()]).unwrap();
+
+    let err = engine.squash_from(&path, &two, "Squashed").unwrap_err();
+    assert!(err.to_string().contains("Staged"), "{err}");
+    assert_eq!(summaries(&path), vec!["Three", "Two", "One"]);
+    let st = engine.status(&path).unwrap();
+    assert!(st.staged.iter().any(|e| e.path == "staged.txt"));
+}
+
+/// Taking back the very first commit deletes the branch ref — not its reflog,
+/// which the Reflog view shows.
+#[test]
+fn taking_back_the_first_commit_keeps_the_branch_reflog() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "a.txt", "a\n");
+    commit_all(&path, "First");
+    let branch = current_branch(&engine, &path);
+
+    engine.undo_last_commit(&path).unwrap();
+
+    let log = engine
+        .reflog(&path, &format!("refs/heads/{branch}"), 50)
+        .unwrap();
+    assert!(!log.is_empty(), "the branch's reflog is kept");
+}
+
+/// "Track with LFS" stages the whole file again — a file staged only in parts
+/// is refused before anything changes.
+#[test]
+fn tracking_with_lfs_refuses_a_file_staged_in_parts() {
+    let (_g, path) = init_repo();
+    let engine = Git2Engine;
+    write(&path, "big.bin", "a\nb\n");
+    commit_all(&path, "Base");
+    write(&path, "big.bin", "A\nb\n");
+    engine.stage(&path, &["big.bin".into()]).unwrap();
+    write(&path, "big.bin", "A\nB\n");
+
+    let err = tg_git_engine::lfs::track(&path, "*.bin", "big.bin").unwrap_err();
+    assert!(err.to_string().contains("in parts"), "{err}");
+    assert!(!path.join(".gitattributes").exists());
 }

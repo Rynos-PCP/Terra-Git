@@ -4,7 +4,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use tg_domain::{ChangeKind, LineKind};
-use tg_git_engine::ops::ConflictOps;
+use tg_git_engine::ops::{ConflictOps, DiscardOps};
 use tg_git_engine::{error::GitEngineError, Git2Engine, GitEngine};
 
 /// Creates a fresh repo with the user config set.
@@ -1315,4 +1315,30 @@ fn amend_without_running_operation_stays_allowed() {
     let log = engine.log(&path, 0, 2).unwrap();
     assert_eq!(log[0].id, id);
     assert_eq!(log.len(), 1, "amend replaces instead of appending");
+}
+
+/// A discarded rename brings the old path back — the snapshot has to know
+/// that too, so a restore removes it again instead of leaving both copies.
+#[test]
+fn discard_protected_rename_round_trip() {
+    let (_guard, path) = rename_fixture();
+    let engine = Git2Engine;
+
+    let name = engine
+        .discard_protected(&path, &["new.txt".into()], 1 << 30)
+        .unwrap();
+    assert!(!path.join("new.txt").exists());
+    assert!(path.join("old.txt").exists());
+
+    engine
+        .restore_discarded(&path, &name, false, 1 << 30)
+        .unwrap();
+    assert_eq!(
+        fs::read_to_string(path.join("new.txt")).unwrap(),
+        RENAME_CONTENT
+    );
+    assert!(
+        !path.join("old.txt").exists(),
+        "the old path has to disappear again"
+    );
 }

@@ -3,11 +3,11 @@
 
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 use tg_domain::ProviderAccount;
 
 fn store_file(app: &AppHandle) -> Option<PathBuf> {
-    let dir = app.path().app_config_dir().ok()?;
+    let dir = crate::jsonstore::config_dir(app)?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("providers.json"))
 }

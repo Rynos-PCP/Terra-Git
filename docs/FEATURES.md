@@ -1,6 +1,6 @@
 # terra-git — Feature overview
 
-As of: 2026-08-31. Reference: GitHub Desktop parity research + community wish list
+As of: 1.1.0 (2026-10-25). Reference: GitHub Desktop parity research + community wish list
 (evidence = GitHub issue numbers from `desktop/desktop`).
 
 ## GitHub Desktop parity
@@ -13,14 +13,14 @@ As of: 2026-08-31. Reference: GitHub Desktop parity research + community wish li
 | Changes list with status | ✅ | ✅ | staged/unstaged, conflict marking |
 | File filter in Changes | ✅ (2025) | ✅ | filter field |
 | Line/hunk selection in the diff | ✅ | ✅ | hunk buttons + clickable line numbers, direction-aware partial patch |
-| Discard (file/hunk/all) | ✅ | ✅ | with confirmation; discard hunk in the diff |
+| Discard (file/hunk/all) | ✅ | ✅ **recoverable** | a copy before every discard (Backups → *Discarded changes*, `Ctrl+Z`), storage limit you set; file counter + cancel for large sets |
 | Choice on branch switch (carry along / leave here) | ✅ | ✅ | dialog before the switch; "carry along" takes the direct route as long as no file collides |
 | Stash on branch switch | ✅ (implicit, 1 stash) | ✅ **better**: full stash list; changes left behind come back on their own when switching back | see community wishes |
 | Ignore (.gitignore) from the UI | ✅ | ✅ | file + *.extension |
 | Commit with summary/description | ✅ | ✅ | incl. 72-character warning |
 | Co-authors | ✅ | ✅ | Co-authored-by trailer |
 | Amend | ✅ | ✅ | checkbox |
-| Undo commit | ✅ | ✅ | soft reset, button below the commit box |
+| Undo commit | ✅ | ✅ | soft reset, button below the commit box — also for the very first commit |
 | History with commit details | ✅ | ✅ | + multi-file diff |
 | Cherry-pick | ✅ (drag & drop) | ✅ (context menu) | sidecar, conflict flow |
 | Squash | ✅ (drag & drop) | ✅ (context menu, last N) | reset --soft + commit |
@@ -32,7 +32,7 @@ As of: 2026-08-31. Reference: GitHub Desktop parity research + community wish li
 | Merge into current branch | ✅ | ✅ | branch menu action |
 | Rebase | ✅ | ✅ | branch menu action |
 | Force push after rebase | ✅ | ✅ | push dropdown, `--force-with-lease` |
-| Conflict resolution UI | ✅ | ✅ | banner + ours/theirs/mergetool per file, continue/abort |
+| Conflict resolution UI | ✅ | ✅ | the conflict workshop: opens by itself, base column always, changed words marked, per block or whole file, mergetool; also for stash conflicts |
 | Pull/push/fetch | ✅ | ✅ | sidecar (credential helper), ahead/behind badges |
 | Create PR | ✅ (GitHub) | ✅ **broader**: in-app via API (GitHub incl. GHES, GitLab self-hosted, Gitea/Forgejo incl. Codeberg) with draft + default target branch; "Create in browser…" in the PR/MR list as an alternative | dialog from PR/MR list, toolbar, palette |
 | Syntax highlighting in the diff | ✅ | ✅ | highlight.js, 21 languages, theme-aware |
@@ -55,6 +55,16 @@ As of: 2026-08-31. Reference: GitHub Desktop parity research + community wish li
 | Progress display for remote ops | ✅ | ✅ | phase + percent (git --progress), thin bar below the toolbar |
 | Clone: open immediately, then load data | ✅ (sidebar) | ✅ | init→open→fetch with clone overlay + progress bar |
 | Multi-select discard | ✅ (checkboxes) | ✅ | Ctrl/Shift-click, Ctrl+A, right-click "Discard (N)" |
+| Changed words within a line | ✅ | ✅ | word diff in unified and split view and in the conflict workshop |
+| Reset to any commit | 🟡 | ✅ | soft / mixed / hard explained, warning for pushed commits, backup + undo step, uncommitted work copied before hard |
+| Reflog | ❌ | ✅ | HEAD and every local branch, terra-git's own backups on top; show, branch, check out, reset from any entry |
+| Compare commits / branches | 🟡 | ✅ | `Ctrl`+click, branch menu, palette: changes since the fork point + commits only one side has; merge, update or PR/MR from there |
+| Update a branch from another one | 🟡 (default branch) | ✅ | any source branch (e.g. a release branch from main), merge or rebase, remembered per branch |
+| Pull/fetch from another remote | ❌ | ✅ | pull split button: remote + branch, fetch one or all |
+| Pull, push and merge without dead ends | 🟡 | ✅ | dialogs for local changes in the way, diverged branches and a rejected push; carried changes come back afterwards |
+| Git LFS | ✅ | ✅ | pointers committed via git, real content on checkout, size diff, missing-git-lfs hint, *Download LFS files*, *Track with Git LFS* |
+| Commit hooks | ✅ | ✅ | commits go through git when hooks exist (also `core.hooksPath`); a refusing hook (also `pre-push`) shows its output |
+| Errors with a way out | 🟡 | ✅ | named codes with a fix in the message: lock file, untrusted folder, identity, certificate, unrelated histories, gone upstream, shallow push, long paths, signing, retry |
 
 **Deliberately different/deferred:** sign-in to a provider account is by personal
 access token — terra-git deliberately relies on system credentials and the OS
@@ -85,15 +95,15 @@ cherry-pick/squash/reorder: implemented as a context menu (functionally equivale
 | +16 | Bisect (#community) | ✅ bisect assistant: start from a commit, then Good/Bad/Skip/Abort in a banner with the remaining steps; the result is parsed locale-free (git ≤ 2.54 and ≥ 2.55 wording) |
 | +17 | Sparse checkout (#community) | ✅ "Sparse checkout…" dialog: pick the top-level directories, apply or disable |
 
-## Community wishes under scrutiny (reviewed 2026-07-08, updated 2026-08-31)
+## Community wishes under scrutiny (reviewed 2026-07-08, updated 2026-10-25)
 
 Seven frequently voiced wishes for Git clients, checked against the actual state:
 
 | Wish | Finding | State / plan |
 |---|---|---|
-| Linux support | The architecture holds: Tauri; system integrations (explorer/terminal/editor) have Linux and macOS branches in `commands.rs`; frontend path joins separator-neutral since 2026-07-08. CI runs the full workspace (tg-app included) on Linux; the release workflow builds AppImage, deb and rpm | Open: no Linux E2E smoke test (the WebDriver harness is Windows/WebView2 only), bundles not code-signed |
+| Linux support | The architecture holds: Tauri; system integrations (explorer/terminal/editor) have Linux and macOS branches in `commands.rs`; frontend path joins separator-neutral since 2026-07-08. CI runs the full workspace (tg-app included) on Linux; the release workflow builds AppImage, deb and rpm | Open: no Linux E2E tests (the WebDriver harness is Windows/WebView2 only), bundles not code-signed |
 | Performance on large repos | Measured, not hoped: `status` ~87 ms at 50k files (git2), sidecar fast path from 30k index entries, commit-graph write after fetch/clone — see [PERFORMANCE.md](PERFORMANCE.md); UI: virtualized lists, history paging, diff streaming with a cap | Largely done; the budgets are enforced as CI gates |
-| Merge conflict presentation | Dedicated conflict editor (ours/theirs/base side by side, segment-wise adoption), conflict banner with continue/abort, mergetool handoff per file | Present; expansion (v2): syntax highlighting in the conflict editor |
+| Merge conflict presentation | The conflict workshop is the one place for conflicts (merge, pull, rebase, cherry-pick, revert, stash): sides named by branch, base column, changed words marked, segment-wise adoption, mergetool handoff, opens by itself | Present; expansion: syntax highlighting in the workshop |
 | Integrated terminal | Deliberate non-goal: GUI focus, no ambition to replace the terminal; "Open terminal here" instead | Not planned |
 | Plugin system | Deliberate non-goal: dilutes focus and the resource target | Not planned |
 | Multiple Git providers | Remote ops are provider-neutral (system git sidecar + the system's credential helpers → any host, any number of accounts); PR/MR: GitHub, GitLab and, since 2026-07-18, Gitea/Forgejo/Codeberg as a full API provider (list, CI status, creation) | Bitbucket stays excluded by project decision; deeper provider APIs (issues, review comments, notifications) follow with the provider layer — see [../ROADMAP.md](../ROADMAP.md) |

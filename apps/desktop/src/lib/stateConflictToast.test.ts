@@ -118,13 +118,13 @@ describe("openConflicts()", () => {
   // component until saved) — a NEW data-loss path that did not exist before.
   it("leaves an open modal standing — unsaved work can live there", () => {
     ui.view = "repo";
-    ui.modal = { kind: "conflictEditor", file: "a.txt" };
+    ui.modal = { kind: "stash" };
     ui.error = "The merge created conflicts";
     ui.errorAction = { kind: "conflicts" };
 
     openConflicts();
 
     expect(ui.view).toBe("conflicts");
-    expect(ui.modal).toEqual({ kind: "conflictEditor", file: "a.txt" });
+    expect(ui.modal).toEqual({ kind: "stash" });
   });
 });

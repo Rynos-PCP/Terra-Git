@@ -64,8 +64,10 @@ npm test             # Vitest (pure frontend logic)
 npm run build
 ```
 
-The E2E smoke tests (`npm run e2e`) boot the real app through tauri-driver
-and need a window (locally, not in the container CI).
+The E2E tests (`npm run e2e`: the smoke test and the destructive flows —
+conflicts, carried changes, a rejected push, undoing the first commit) boot the
+real app through tauri-driver and need a window (locally on Windows, not in the
+container CI). Setup: [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 **Supply chain / licenses** (CI gate `cargo deny check`, see `deny.toml`):
 

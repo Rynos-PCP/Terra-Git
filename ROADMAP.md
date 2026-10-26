@@ -4,7 +4,23 @@ What is already in, what is being worked on next, and what will deliberately
 never be built. There are no dates in this file: terra-git is maintained by one
 person in spare time, and a date would be a guess dressed up as a commitment.
 
-## Shipped in 1.0.0
+## Shipped
+
+### 1.1.0
+
+1.1.0 is about not losing work and not ending up in dead ends. Every discard
+keeps a copy you can restore, within a storage limit you set; a hard reset
+copies uncommitted work first; the very first commit can be changed and taken
+back. Every conflict — merge, pull, rebase, cherry-pick, a stash put back —
+ends up in one conflict workshop with the base as a third column. A refused
+pull or push becomes a choice instead of an error, the current branch can be
+updated from any other one, and pull and fetch work from any remote. New: a
+reflog view, reset to any commit, comparing two commits or branches, Git LFS
+basics, highlighted words inside changed lines, commit hooks, and common errors
+named with the way out in the message. Opening a repository folder runs nothing
+that folder defines.
+
+### 1.0.0
 
 1.0.0 is the first public release. It covers full GitHub Desktop parity —
 staging down to hunks and lines, branches, merge and rebase, conflict
@@ -18,15 +34,16 @@ sparse checkout.
 - Feature by feature against GitHub Desktop: [docs/FEATURES.md](docs/FEATURES.md).
 - Why it is built the way it is: [ARCHITECTURE.md](ARCHITECTURE.md).
 
-The limitations that ship with it are listed in the changelog: the bundles are
-not code-signed, there is no auto-update, sign-in is by personal access token
-only, and hunk staging has a known race. All four have an entry under Next.
+The limitations that ship with each release are listed in the changelog: the
+bundles are not code-signed, there is no auto-update, sign-in is by personal
+access token only, and hunk staging has a known race. All four have an entry
+under Next.
 
 ## Next
 
 Roughly in the order they matter, not in the order they are easy.
 
-- **Code signing and notarization.** The 1.0.0 bundles are unsigned, so Windows
+- **Code signing and notarization.** The bundles are unsigned, so Windows
   SmartScreen and macOS Gatekeeper greet every new user with an "unknown
   publisher" warning. This is the first thing anyone sees and therefore the top
   item; it is blocked on paying for certificates rather than on code.
@@ -35,9 +52,9 @@ Roughly in the order they matter, not in the order they are easy.
   update, so this lands with signing, not before it.
 - **Linux bundles proven on a real runner.** CI builds and tests the whole
   workspace on Linux, and the release workflow produces an AppImage, a `.deb`
-  and an `.rpm` — but nothing ever launches the built app there. The E2E smoke
-  test needs WebView2 and runs on Windows only. Until that gap is closed, the
-  Linux artefacts are built but unproven.
+  and an `.rpm` — but nothing ever launches the built app there. The E2E tests
+  (the smoke test and the destructive flows) need WebView2 and run on Windows
+  only. Until that gap is closed, the Linux artefacts are built but unproven.
 - **OAuth sign-in alongside personal access tokens.** A PAT is currently the
   only way to connect a GitHub, GitLab or Gitea/Forgejo account, which is the
   steepest part of
@@ -45,7 +62,7 @@ Roughly in the order they matter, not in the order they are easy.
 - **Deeper provider APIs.** Pull and merge requests can be listed and created,
   with CI status inline. Issues, review comments and notifications cannot.
 - **Syntax highlighting in the conflict editor.** The diff view highlights 21
-  languages; the conflict workbench still shows plain text. Same machinery, a
+  languages; the conflict workshop still shows plain text. Same machinery, a
   different view to wire it into.
 - **A virtualized history overview.** The large vertical graph renders every
   commit it has loaded. The lists beside it are virtualized; this one is not,
@@ -55,6 +72,12 @@ Roughly in the order they matter, not in the order they are easy.
   between, what gets applied can differ from what was displayed. The fix is to
   check that the blob has not moved between rendering and applying, and to say
   so instead of guessing.
+- **Power features.** The history of a single file; pushing tags and deleting
+  remote tags and branches; folding a change into an older unpushed commit; a
+  merge preview ("brings in 7 commits, 2 files will conflict"); ignoring
+  whitespace in diffs and searching inside changes; a dashboard of all your
+  repositories; cloning from your account's repository list; Git LFS file
+  locks.
 - **Precise performance tracking.** CI has a budget gate that catches
   catastrophic regressions — hangs and O(n²) blowups — but its thresholds are
   deliberately generous multiples of the real targets, so a gradual slide goes

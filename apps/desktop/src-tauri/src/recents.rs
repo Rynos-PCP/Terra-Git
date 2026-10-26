@@ -7,7 +7,7 @@
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
-use tauri::{AppHandle, Manager};
+use tauri::AppHandle;
 
 const MAX_RECENTS: usize = 15;
 
@@ -43,7 +43,7 @@ enum StoredRecent {
 }
 
 fn store_file(app: &AppHandle) -> Option<PathBuf> {
-    let dir = app.path().app_config_dir().ok()?;
+    let dir = crate::jsonstore::config_dir(app)?;
     std::fs::create_dir_all(&dir).ok()?;
     Some(dir.join("recent_repos.json"))
 }

@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { confirm, open } from "@tauri-apps/plugin-dialog";
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { confirm } from "../dialogs";
   import { api, type WorktreeInfo } from "../api";
   import { t } from "../i18n.svelte";
   import { openRepo, refreshBranches, showError, showInfo, ui } from "../state.svelte";

@@ -26,10 +26,14 @@ with **Tauri 2** (Rust core) and **Svelte 5**, with first-class support for
   have keep working — terra-git never asks you into an OAuth silo of its own.
   Provider tokens live in the OS keychain and nowhere else.
 - **Complete.** The whole GitHub Desktop day-to-day workflow, plus the things its
-  issue tracker keeps asking for: hunk- and line-level staging, a real conflict
-  workbench, interactive rebase, a full stash manager, worktrees, submodules,
-  sparse checkout, blame and bisect. The parity matrix, with issue numbers and
-  reaction counts: [docs/FEATURES.md](docs/FEATURES.md).
+  issue tracker keeps asking for: hunk- and line-level staging, a conflict
+  workshop for every kind of conflict, interactive rebase, a full stash manager,
+  reflog, worktrees, submodules, sparse checkout, Git LFS, blame and bisect. The
+  parity matrix, with issue numbers and reaction counts:
+  [docs/FEATURES.md](docs/FEATURES.md).
+- **Hard to lose work.** Every discard keeps a copy you can bring back, a hard
+  reset copies your uncommitted work first, and every history rewrite leaves a
+  backup. Common errors come with the way out right in the message.
 
 ## Download
 
@@ -46,7 +50,7 @@ Known limitations, stated up front:
 
 - **The bundles are not code-signed.** Windows SmartScreen and macOS Gatekeeper
   will call terra-git an unknown publisher on first launch. That is deliberate
-  for 1.0 — there is no budget for certificates and notarization yet.
+  for now — there is no budget for certificates and notarization yet.
 - **There is no auto-update.** New versions are announced on the releases page;
   watch the repository if you want to hear about them.
 - **Sign-in to GitHub, GitLab and Gitea/Forgejo is by personal access token**,
@@ -60,8 +64,11 @@ Known limitations, stated up front:
 
 - **Git 2.40 or newer on your `PATH`.** Remote operations shell out to your
   system `git` — that is what makes your existing credential helpers and SSH
-  agents work. Everything local runs without it; fetch, pull, push and clone
-  do not.
+  agents work. So do merges and rebases, commits in repositories with hooks or
+  signing, and everything in Git LFS repositories; reading, staging and plain
+  commits run in-process.
+- **Git LFS (`git-lfs`)** for repositories that use it. terra-git says so when it
+  is missing and links to the installer.
 - **Windows:** the WebView2 runtime (preinstalled on Windows 11).
 - **Linux:** WebKitGTK 4.1 (`libwebkit2gtk-4.1-0`) and GTK 3 (`libgtk-3-0`). On
   some VMs and GPUs the AppImage comes up as a blank white window — start it
@@ -72,7 +79,8 @@ Known limitations, stated up front:
 
 - **Staging and diff** — stage or discard down to the hunk and the single line,
   with direction-aware partial patches; tree or list view; file filter;
-  multi-select discard; syntax highlighting for 21 languages; image diffs.
+  multi-select discard; the changed words inside a changed line highlighted;
+  syntax highlighting for 21 languages; image diffs.
 - **Committing** — summary and description with the 72-character warning,
   co-authors, amend with a warning once the commit is already pushed, a
   per-repository message history, GPG/SSH signing through system `git`.
@@ -80,15 +88,31 @@ Known limitations, stated up front:
   search over message, author and ID, a switchable side-by-side diff, blame per
   file, a bisect assistant.
 - **Rewriting history** — cherry-pick, revert, squash, interactive rebase as a
-  UI, multi-step undo and redo. Before every rewrite terra-git writes a backup
-  ref on its own, with a restore view to bring the old state back.
-- **Conflicts** — a conflict workbench that labels the two sides with the actual
-  branch names instead of "ours" and "theirs", takes changes over segment by
-  segment, and hands off to your external merge tool per file.
+  UI, a commit workshop for unpushed commits, multi-step undo and redo — the very
+  first commit included. Reset to any commit (soft, mixed or hard), and a reflog
+  view that finds commits lost to a reset or rebase. Before every rewrite
+  terra-git writes a backup ref on its own, with a restore view to bring the old
+  state back.
+- **Nothing discarded for good** — every discard, down to a single hunk, keeps a
+  copy of what it throws away; `Ctrl+Z` or the Backups dialog brings it back. The
+  copies stay until you delete them, within a storage limit you set.
+- **Conflicts** — one conflict workshop for every conflict (merge, pull, rebase,
+  cherry-pick, a stash put back): it labels the two sides with the actual branch
+  names instead of "ours" and "theirs", shows the common base as a third column,
+  takes changes over segment by segment, and hands off to your external merge
+  tool per file.
 - **Branches and remotes** — create, switch, rename, delete with a merged check,
-  merge, rebase, force-push with `--force-with-lease` behind a confirmation, and
+  merge, rebase, update the current branch from any other one, compare two
+  branches or commits, pull and fetch from any remote, publish a branch without
+  its commits, force-push with `--force-with-lease` behind a confirmation, and
   full remote management (add, rename, change URL, remove) — still an open
-  request on GitHub Desktop (#15797).
+  request on GitHub Desktop (#15797). A refused pull or push becomes a choice
+  (merge or rebase, bring your changes along) instead of a dead end.
+- **Git LFS** — track files or whole extensions, download missing objects, and
+  diffs of LFS files that show the sizes instead of the pointer text.
+- **Errors with a way out** — a leftover `index.lock`, a folder git does not
+  trust, a missing identity, a path too long for Windows, a failed signature, a
+  deleted remote branch: each gets its own message and a button that fixes it.
 - **Providers** — create and list pull and merge requests in the app for GitHub
   (incl. GHES), GitLab (incl. self-hosted) and Gitea/Forgejo (incl. Codeberg),
   CI status inline; from the list, "Create in browser…" hands the request over to
@@ -137,7 +161,9 @@ Prerequisites:
 
 - **Rust**, stable, via [rustup](https://rustup.rs) — `rust-toolchain.toml` pins
   the channel and pulls in clippy and rustfmt.
-- **Node.js 20.19 or newer** (CI builds on 22, pinned in `.nvmrc`) and npm.
+- **Node.js 22.12 or newer** (pinned in `.nvmrc`; Vitest 5 needs it) and npm.
+- **`git` and `git-lfs`** on the `PATH` for the test suites: the engine tests run
+  real git, the LFS round trips need `git-lfs`.
 - **A C toolchain** for the vendored libgit2: MSVC Build Tools 2022 with the C++
   workload on Windows, the Xcode command line tools on macOS, `build-essential`
   on Linux.

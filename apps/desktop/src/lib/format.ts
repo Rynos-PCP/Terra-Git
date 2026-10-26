@@ -40,6 +40,11 @@ export function initials(name: string): string {
   return (parts[0][0] + parts[parts.length - 1][0]).toUpperCase();
 }
 
+/** A count with the active language's digit grouping ("24.780" / "24,780"). */
+export function formatCount(n: number): string {
+  return n.toLocaleString(i18n.lang === "de" ? "de-DE" : "en-US");
+}
+
 /** Human-readable byte size (1 KB = 1024). */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
@@ -62,18 +67,37 @@ export function formatBytes(n: number): string {
   return `${v.toFixed(decimals)} ${units[i]}`;
 }
 
+/** The web page of a remote (GitHub/GitLab/self-hosted), or null. Credentials
+ *  in an https remote (`https://user:token@host/…`) never reach the browser
+ *  — they would land in its history. */
+export function webUrlOfRemote(url: string): string | null {
+  // ssh: git@host:path.git -> https://host/path
+  const ssh = url.match(/^(?:ssh:\/\/)?git@([^:/]+)[:/](.+?)(?:\.git)?$/);
+  if (ssh) return `https://${ssh[1]}/${ssh[2]}`;
+  // Keep the protocol (http/https) — self-hosted GitLab sometimes runs over http only.
+  const web = url.match(/^(https?):\/\/(.+?)(?:\.git)?$/);
+  if (web) return `${web[1]}://${web[2].replace(/^[^/]*@/, "")}`;
+  return null;
+}
+
 /** Derives the default folder name from a clone URL: the last path segment
  *  without a trailing ".git". Covers the scp form (git@host:owner/repo.git) and
- *  http(s)/ssh URLs. An empty string when nothing sensible can be derived. */
+ *  http(s)/ssh URLs. An empty string when nothing sensible can be derived.
+ *  Only letters, digits, `.`, `_` and `-` survive: a URL decides this name, and
+ *  characters like `;` mean something to the programs a folder is later handed
+ *  to (Windows Terminal splits its command line there). */
 export function deriveCloneName(url: string): string {
-  return (
+  const last =
     url
       .trim()
       .replace(/\/+$/, "")
-      .split("/")
+      .split(/[/:]/)
       .pop()
-      ?.replace(/\.git$/, "") ?? ""
-  );
+      ?.replace(/\.git$/, "") ?? "";
+  return last
+    .replace(/[^\p{L}\p{N}._-]+/gu, "-")
+    .replace(/^[.-]+/, "")
+    .replace(/-+$/, "");
 }
 
 /** Shortens long paths in the middle ("C:/Users/…/foo/bar"). */

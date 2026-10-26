@@ -9,8 +9,12 @@
 
 pub mod cancel;
 mod conflict;
+pub mod discarded;
 pub mod error;
+pub mod lfs;
 pub mod ops;
+pub mod remedies;
+pub mod repo_commands;
 pub mod ssh;
 // The sidecar (system git) is engine-INTERNAL: the app/tests never see it
 // directly, only through the Git2Engine surface (clone_prepare/clone_fetch/fetch_with_progress …).
@@ -83,9 +87,72 @@ pub trait GitEngine: Send + Sync {
 pub struct Git2Engine;
 
 impl Git2Engine {
+    /// The staging loop behind [`GitEngine::stage`], with a running count of
+    /// processed paths for `on_done` and a cancel check between paths. The
+    /// index is written only at the very end, so a cancelled run stages
+    /// nothing. (libgit2 stays the engine here on purpose: measured on fresh
+    /// files it stages twice as fast as `git add`, which also has to write
+    /// every new object — and parallel pre-writing did not help either.)
+    pub(crate) fn stage_reporting(
+        &self,
+        path: &Path,
+        files: &[String],
+        cancel: Option<&CancelToken>,
+        on_done: &mut dyn FnMut(usize),
+    ) -> Result<()> {
+        let repo = self.open(path)?;
+        let workdir = Self::workdir(&repo)?;
+        let mut index = repo.index()?;
+        // Rename detection only when a path is not in the index — only then can
+        // it be the new side of a workdir rename.
+        let renames = if files
+            .iter()
+            .any(|f| index.get_path(Path::new(f), 0).is_none())
+        {
+            rename_pairs(&repo, false)?
+        } else {
+            HashMap::new()
+        };
+        // Paths behind a filter driver (Git LFS) go through `git add` after
+        // the rest: libgit2 would store the content instead of the pointer.
+        let mut filtered: Vec<String> = Vec::new();
+        let mut done = 0;
+        for file in files {
+            if cancel.is_some_and(CancelToken::is_cancelled) {
+                return Err(GitEngineError::Cancelled);
+            }
+            let rel = Path::new(file);
+            let abs = workdir.join(rel);
+            // Deleted files are staged by removing them from the index.
+            if abs.symlink_metadata().is_ok() {
+                if abs.is_file() && lfs::has_filter(&repo, rel) {
+                    filtered.push(file.clone());
+                } else {
+                    index.add_path(rel)?;
+                }
+            } else {
+                index.remove_path(rel)?;
+            }
+            // Rename: removing the old path belongs to the same status entry and
+            // is staged along with it — otherwise it stays behind as an unstaged
+            // deletion.
+            if let Some(old) = renames.get(file) {
+                index.remove_path(Path::new(old))?;
+            }
+            done += 1;
+            on_done(done);
+        }
+        index.write()?;
+        if !filtered.is_empty() {
+            drop(index);
+            drop(repo);
+            lfs::stage_filtered(path, &filtered, cancel, &mut |n| on_done(done + n))?;
+        }
+        Ok(())
+    }
+
     fn open(&self, path: &Path) -> Result<Repository> {
-        let repo = Repository::discover(path)
-            .map_err(|_| GitEngineError::NotARepository(path.display().to_string()))?;
+        let repo = Repository::discover(path).map_err(|e| error::open_error(path, e))?;
         if repo.is_bare() {
             return Err(GitEngineError::NotARepository(format!(
                 "{} (bare repositories are not supported)",
@@ -154,12 +221,21 @@ impl Git2Engine {
         let mut opts = StatusOptions::new();
         opts.include_untracked(true)
             .recurse_untracked_dirs(true)
-            .renames_head_to_index(true)
-            .renames_index_to_workdir(true)
             .include_ignored(false)
             .exclude_submodules(true);
 
-        let statuses = repo.statuses(Some(&mut opts))?;
+        // First without rename detection (cheap), then — only where affordable
+        // — again with it. See RENAME_PAIR_BUDGET.
+        let plain = repo.statuses(Some(&mut opts))?;
+        let sides = RenameSides::affordable(&plain);
+        let statuses = if sides.any() {
+            drop(plain);
+            opts.renames_head_to_index(sides.head_to_index)
+                .renames_index_to_workdir(sides.index_to_workdir);
+            repo.statuses(Some(&mut opts))?
+        } else {
+            plain
+        };
         let mut staged = Vec::new();
         let mut unstaged = Vec::new();
 
@@ -352,22 +428,82 @@ fn delta_paths(delta: &git2::DiffDelta<'_>) -> (String, Option<String>) {
     (new, old)
 }
 
+/// Upper bound for inexact rename detection, in candidate pairs (added ×
+/// deleted files) per status side. libgit2 compares every candidate pair —
+/// unlike git, which gives up beyond `diff.renameLimit²` — so a change set of
+/// 6,800 new and 1,000 deleted files took ~17 s per status instead of ~1 s
+/// (user report: staging ~25k files appeared frozen). Measured cost ≈ 2.5 µs per
+/// pair when nothing is similar, so the budget costs at most ~0.6 s. Beyond it
+/// additions and deletions are shown as such — as git does when it skips rename
+/// detection.
+pub(crate) const RENAME_PAIR_BUDGET: usize = 250_000;
+
+/// Which status sides can afford rename detection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct RenameSides {
+    pub head_to_index: bool,
+    pub index_to_workdir: bool,
+}
+
+impl RenameSides {
+    /// Decided from a status taken WITHOUT rename detection: a side needs both
+    /// additions and deletions to have renames at all, and their product has to
+    /// fit the budget.
+    pub(crate) fn affordable(statuses: &git2::Statuses<'_>) -> Self {
+        let (mut index_new, mut index_deleted, mut wt_new, mut wt_deleted) = (0, 0, 0, 0);
+        for entry in statuses.iter() {
+            let st = entry.status();
+            index_new += usize::from(st.contains(Status::INDEX_NEW));
+            index_deleted += usize::from(st.contains(Status::INDEX_DELETED));
+            wt_new += usize::from(st.contains(Status::WT_NEW));
+            wt_deleted += usize::from(st.contains(Status::WT_DELETED));
+        }
+        Self {
+            head_to_index: rename_affordable(index_new, index_deleted),
+            index_to_workdir: rename_affordable(wt_new, wt_deleted),
+        }
+    }
+
+    pub(crate) fn any(self) -> bool {
+        self.head_to_index || self.index_to_workdir
+    }
+}
+
+/// Rename detection is worth running for `added` × `deleted` candidates.
+pub(crate) fn rename_affordable(added: usize, deleted: usize) -> bool {
+    added > 0 && deleted > 0 && added.saturating_mul(deleted) <= RENAME_PAIR_BUDGET
+}
+
 /// Rename pairs (new path -> old path) of one status side: `staged` is
 /// index↔HEAD, otherwise workdir↔index. The status reports renames as ONE entry
 /// with the new path — but stage/unstage/discard have to handle BOTH sides and
 /// therefore call the detection ONCE per call (not per file), and only when a
 /// given path can be the new side of a rename at all.
-fn rename_pairs(repo: &Repository, staged: bool) -> Result<HashMap<String, String>> {
+pub(crate) fn rename_pairs(repo: &Repository, staged: bool) -> Result<HashMap<String, String>> {
     let mut opts = StatusOptions::new();
     opts.include_ignored(false).exclude_submodules(true);
     if staged {
-        opts.show(StatusShow::Index).renames_head_to_index(true);
+        opts.show(StatusShow::Index);
     } else {
         // Untracked files are the possible rename targets in the worktree.
         opts.show(StatusShow::Workdir)
             .include_untracked(true)
-            .recurse_untracked_dirs(true)
-            .renames_index_to_workdir(true);
+            .recurse_untracked_dirs(true);
+    }
+    // Same budget as the status: where the status shows no renames, there are
+    // none to pair up here either.
+    let sides = RenameSides::affordable(&repo.statuses(Some(&mut opts))?);
+    if !(if staged {
+        sides.head_to_index
+    } else {
+        sides.index_to_workdir
+    }) {
+        return Ok(HashMap::new());
+    }
+    if staged {
+        opts.renames_head_to_index(true);
+    } else {
+        opts.renames_index_to_workdir(true);
     }
     let statuses = repo.statuses(Some(&mut opts))?;
     let mut pairs = HashMap::new();
@@ -425,8 +561,14 @@ const MAX_DIFF_LINES_PER_FILE: usize = 5000;
 /// (line-truncated per file) and can end the iteration with `false` (e.g. the
 /// file-count cap of the IPC streaming). Returns the TOTAL number of files in
 /// the diff — regardless of how many the sink accepted.
-fn stream_diff(diff: &git2::Diff<'_>, sink: &mut dyn FnMut(FileDiff) -> bool) -> Result<usize> {
+fn stream_diff(
+    repo: &Repository,
+    diff: &git2::Diff<'_>,
+    sink: &mut dyn FnMut(FileDiff) -> bool,
+) -> Result<usize> {
     let total = diff.deltas().len();
+    // LFS files show sizes instead of the pointer text.
+    let lfs_repo = lfs::uses_lfs(repo);
     // RefCell/Cell because the three callbacks have to mutate at the same time.
     let current: RefCell<Option<FileDiff>> = RefCell::new(None);
     let line_count: RefCell<usize> = RefCell::new(0);
@@ -443,7 +585,7 @@ fn stream_diff(diff: &git2::Diff<'_>, sink: &mut dyn FnMut(FileDiff) -> bool) ->
                 }
             }
             let (path, old_path) = delta_paths(&delta);
-            *current.borrow_mut() = Some(FileDiff {
+            let mut fd = FileDiff {
                 path,
                 old_path,
                 is_binary: delta.flags().is_binary(),
@@ -451,7 +593,12 @@ fn stream_diff(diff: &git2::Diff<'_>, sink: &mut dyn FnMut(FileDiff) -> bool) ->
                 truncated: false,
                 old_size: delta.old_file().exists().then(|| delta.old_file().size()),
                 new_size: delta.new_file().exists().then(|| delta.new_file().size()),
-            });
+                lfs: false,
+            };
+            if lfs_repo {
+                lfs::describe(repo, &delta, &mut fd);
+            }
+            *current.borrow_mut() = Some(fd);
             *line_count.borrow_mut() = 0;
             true
         },
@@ -461,6 +608,9 @@ fn stream_diff(diff: &git2::Diff<'_>, sink: &mut dyn FnMut(FileDiff) -> bool) ->
             let Some(file) = current.as_mut() else {
                 return true;
             };
+            if file.lfs {
+                return true;
+            }
             if *line_count.borrow() >= MAX_DIFF_LINES_PER_FILE {
                 file.truncated = true;
                 return true;
@@ -478,6 +628,9 @@ fn stream_diff(diff: &git2::Diff<'_>, sink: &mut dyn FnMut(FileDiff) -> bool) ->
             let Some(file) = current.as_mut() else {
                 return true;
             };
+            if file.lfs {
+                return true;
+            }
             let kind = match line.origin() {
                 '+' => LineKind::Addition,
                 '-' => LineKind::Deletion,
@@ -524,9 +677,18 @@ fn stream_diff(diff: &git2::Diff<'_>, sink: &mut dyn FnMut(FileDiff) -> bool) ->
 }
 
 /// Turns a git2 diff into domain [`FileDiff`]s (truncated per file).
-fn collect_diff(diff: &git2::Diff<'_>) -> Result<Vec<FileDiff>> {
+/// [`stream_diff`] for the other engine modules (range diffs).
+pub(crate) fn stream_diff_pub(
+    repo: &Repository,
+    diff: &git2::Diff<'_>,
+    sink: &mut dyn FnMut(FileDiff) -> bool,
+) -> Result<usize> {
+    stream_diff(repo, diff, sink)
+}
+
+fn collect_diff(repo: &Repository, diff: &git2::Diff<'_>) -> Result<Vec<FileDiff>> {
     let mut files = Vec::new();
-    stream_diff(diff, &mut |fd| {
+    stream_diff(repo, diff, &mut |fd| {
         files.push(fd);
         true
     })?;
@@ -649,7 +811,10 @@ impl GitEngine for Git2Engine {
         // (status_via_sidecar) is gone in the fast path (no double index access).
         let repo = self.open(path)?;
         let index_entries = repo.index().map(|i| i.len()).unwrap_or(0);
-        if index_entries >= status_fast::FAST_PATH_MIN_INDEX_ENTRIES {
+        // Filter drivers (Git LFS): only the system git runs the clean filter,
+        // libgit2 would compare the content against the pointer.
+        if index_entries >= status_fast::FAST_PATH_MIN_INDEX_ENTRIES || lfs::declares_filters(&repo)
+        {
             match self.status_fast_path(repo, path) {
                 Ok(fast) => return Ok(fast),
                 Err(e) => tracing::warn!("status fast path failed, falling back to git2: {e}"),
@@ -737,13 +902,13 @@ impl GitEngine for Git2Engine {
             repo.diff_index_to_workdir(None, Some(&mut opts))?
         };
 
-        Ok(collect_diff(&diff)?.into_iter().next())
+        Ok(collect_diff(&repo, &diff)?.into_iter().next())
     }
 
     fn commit_diff(&self, path: &Path, commit_id: &str) -> Result<Vec<FileDiff>> {
         let repo = self.open(path)?;
         let diff = build_commit_diff(&repo, commit_id)?;
-        collect_diff(&diff)
+        collect_diff(&repo, &diff)
     }
 
     fn commit_diff_stream(
@@ -756,7 +921,7 @@ impl GitEngine for Git2Engine {
         let repo = self.open(path)?;
         let diff = build_commit_diff(&repo, commit_id)?;
         let mut sent = 0usize;
-        stream_diff(&diff, &mut |fd| {
+        stream_diff(&repo, &diff, &mut |fd| {
             if sent == max_files {
                 return false;
             }
@@ -769,37 +934,7 @@ impl GitEngine for Git2Engine {
     }
 
     fn stage(&self, path: &Path, files: &[String]) -> Result<()> {
-        let repo = self.open(path)?;
-        let workdir = Self::workdir(&repo)?;
-        let mut index = repo.index()?;
-        // Rename detection only when a path is not in the index — only then can
-        // it be the new side of a workdir rename.
-        let renames = if files
-            .iter()
-            .any(|f| index.get_path(Path::new(f), 0).is_none())
-        {
-            rename_pairs(&repo, false)?
-        } else {
-            HashMap::new()
-        };
-        for file in files {
-            let rel = Path::new(file);
-            let abs = workdir.join(rel);
-            // Deleted files are staged by removing them from the index.
-            if abs.symlink_metadata().is_ok() {
-                index.add_path(rel)?;
-            } else {
-                index.remove_path(rel)?;
-            }
-            // Rename: removing the old path belongs to the same status entry and
-            // is staged along with it — otherwise it stays behind as an unstaged
-            // deletion.
-            if let Some(old) = renames.get(file) {
-                index.remove_path(Path::new(old))?;
-            }
-        }
-        index.write()?;
-        Ok(())
+        self.stage_reporting(path, files, None, &mut |_| {})
     }
 
     fn unstage(&self, path: &Path, files: &[String]) -> Result<()> {
@@ -905,162 +1040,14 @@ impl GitEngine for Git2Engine {
                 cb.path(file.as_str());
             }
             repo.checkout_index(None, Some(&mut cb))?;
+            let tracked: Vec<String> = tracked.into_iter().cloned().collect();
+            lfs::restore_content(&repo, Some(&tracked));
         }
         Ok(())
     }
 
     fn commit(&self, path: &Path, message: &str, amend: bool) -> Result<String> {
-        if message.trim().is_empty() {
-            return Err(GitEngineError::EmptyCommitMessage);
-        }
-        let mut repo = self.open(path)?;
-
-        // Safety net: an amend is a history rewrite → anchor the old HEAD
-        // beforehand as a durable backup (refs/terra-git/backup/). The volatile
-        // undo stack survives no app restart/gc, a real reference does. Only when
-        // HEAD exists and no merge is running (an amend during a merge is
-        // rejected below anyway) — otherwise a backup would be created that only
-        // masks the actual error.
-        if amend
-            && repo.state() != git2::RepositoryState::Merge
-            && repo.head().and_then(|h| h.peel_to_commit()).is_ok()
-        {
-            crate::ops::create_backup_ref(&repo, "amend")?;
-        }
-
-        // Signed commits (commit.gpgsign=true) go through the system git, which
-        // handles GPG/SSH signing and hooks correctly (community request #78).
-        let signing = repo
-            .config()
-            .and_then(|c| c.get_bool("commit.gpgsign"))
-            .unwrap_or(false);
-        if signing {
-            drop(repo);
-            // PID + nanos: no predictable name (symlink attack in /tmp).
-            let msg_file = std::env::temp_dir().join(format!(
-                "terra-git-msg-{}-{}.txt",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or_default()
-            ));
-            std::fs::write(&msg_file, message)?;
-            let msg_path = msg_file.to_string_lossy().into_owned();
-            let mut args: Vec<&str> = vec!["commit", "-F", &msg_path];
-            if amend {
-                args.push("--amend");
-            }
-            let result = sidecar::run_git(path, &args);
-            let _ = std::fs::remove_file(&msg_file);
-            result?;
-            let repo = self.open(path)?;
-            let id = repo.head()?.peel_to_commit()?.id().to_string();
-            return Ok(id);
-        }
-
-        let state = repo.state();
-        let merging = state == git2::RepositoryState::Merge;
-        // Cherry-pick/revert (also as a sequence) leave CHERRY_PICK_HEAD/
-        // REVERT_HEAD/.git/sequencer behind — after a successful commit, clean
-        // them up just like the merge state, otherwise "continue" fails afterwards
-        // and "abort" is refused. The commit itself stays a single-parent commit
-        // as before (no MERGE_HEADs in these states).
-        let sequencing = matches!(
-            state,
-            git2::RepositoryState::CherryPick
-                | git2::RepositoryState::CherryPickSequence
-                | git2::RepositoryState::Revert
-                | git2::RepositoryState::RevertSequence
-        );
-        // Collect the MERGE_HEADs right away (needs &mut before borrows appear).
-        let mut merge_oids: Vec<Oid> = Vec::new();
-        if merging {
-            repo.mergehead_foreach(|oid| {
-                merge_oids.push(*oid);
-                true
-            })?;
-        }
-        let sig = repo.signature()?;
-        let mut index = repo.index()?;
-        let tree_id = index.write_tree()?;
-        let tree = repo.find_tree(tree_id)?;
-
-        if amend {
-            // Reject an amend during ANY running multi-step operation, not only
-            // during a merge: otherwise amend() replaces our OWN
-            // predecessor commit with the result of the running operation — the
-            // foreign change lands in our commit, ours is gone, and the operation
-            // state remains. Real git refuses this explicitly ("You are in the
-            // middle of a cherry-pick -- cannot amend"), and the sidecar path
-            // passes exactly that error through; only the git2 path did it
-            // silently. On a merge it would additionally produce a falsified
-            // merge parent.
-            if state != git2::RepositoryState::Clean {
-                return Err(GitEngineError::Sidecar {
-                    message: "Cannot amend while an operation is in progress — continue or abort it first"
-                        .into(),
-                });
-            }
-            // Only "no commit present" is NothingToAmend; real errors (corrupt
-            // refs, I/O) are passed through with their cause.
-            let head_commit = match repo.head().and_then(|h| h.peel_to_commit()) {
-                Ok(c) => c,
-                Err(e) if is_unborn(&e) => return Err(GitEngineError::NothingToAmend),
-                Err(e) => return Err(e.into()),
-            };
-            let new_id =
-                head_commit.amend(Some("HEAD"), None, None, None, Some(message), Some(&tree))?;
-            return Ok(new_id.to_string());
-        }
-
-        // Parents: HEAD + all MERGE_HEADs during a running merge (merge commit!).
-        // Without that, a commit after a conflicted pull would not record the
-        // remote history as merged.
-        let mut parents_owned: Vec<git2::Commit<'_>> = Vec::new();
-        match repo.head() {
-            Ok(head) => parents_owned.push(head.peel_to_commit()?),
-            Err(e) if is_unborn(&e) => {}
-            Err(e) => return Err(e.into()),
-        }
-        for oid in merge_oids {
-            parents_owned.push(repo.find_commit(oid)?);
-        }
-        // Author vs. committer: on a cherry-pick a foreign commit TRAVELS — its
-        // authorship still belongs to the original, only the committer is whoever
-        // finishes the pick. That is exactly how `git commit` behaves when
-        // finishing a conflicted cherry-pick (verified empirically), and so does
-        // the sidecar path (commit.gpgsign) and the banner button
-        // (`cherry-pick --continue`) — the git2 path was the only one that
-        // silently replaced the foreign authorship with our own and deleted the
-        // source (CHERRY_PICK_HEAD) with cleanup_state() on top.
-        //
-        // Not so for a REVERT: there a new commit is created that takes the change
-        // back — its author is whoever reverts. Also just like git.
-        let author = if matches!(
-            state,
-            git2::RepositoryState::CherryPick | git2::RepositoryState::CherryPickSequence
-        ) {
-            crate::ops::gitdir_oid(&repo, "CHERRY_PICK_HEAD")
-                .and_then(|oid| repo.find_commit(oid).ok())
-                .map(|c| c.author().to_owned())
-                .unwrap_or_else(|| sig.to_owned())
-        } else {
-            sig.to_owned()
-        };
-        let id = {
-            let parents: Vec<&git2::Commit<'_>> = parents_owned.iter().collect();
-            repo.commit(Some("HEAD"), &author, &sig, message, &tree, &parents)?
-        };
-        if merging || sequencing {
-            // Release the borrows, then clean up MERGE_HEAD/MERGE_MSG or
-            // CHERRY_PICK_HEAD/REVERT_HEAD/sequencer — otherwise the repo stays
-            // "in a merge"/"in a cherry-pick" as far as git is concerned.
-            drop(parents_owned);
-            drop(tree);
-            repo.cleanup_state()?;
-        }
-        Ok(id.to_string())
+        self.commit_with(path, message, amend, false)
     }
 
     fn branches(&self, path: &Path) -> Result<Vec<BranchInfo>> {
@@ -1246,15 +1233,20 @@ impl Git2Engine {
                 on(tg_domain::GitProgress {
                     phase: "checkout".to_string(),
                     percent,
+                    done: None,
+                    total: None,
                 });
             });
             repo.checkout_tree(&object, Some(&mut cb))
                 .map_err(|e| checkout_error(e, blocked.borrow().clone()))?;
         }
         repo.set_head(&refname)?;
+        lfs::restore_content(&repo, None);
         on(tg_domain::GitProgress {
             phase: "checkout".to_string(),
             percent: 100,
+            done: None,
+            total: None,
         });
         Ok(())
     }
@@ -1296,7 +1288,61 @@ impl crate::ops::RemoteProgressOps for Git2Engine {
         cancel: &CancelToken,
         on: &mut dyn FnMut(tg_domain::GitProgress),
     ) -> Result<String> {
-        sidecar::fetch_streaming(path, cancel, on)
+        sidecar::fetch_streaming(path, sidecar::FetchTarget::Default, cancel, on)
+    }
+
+    fn fetch_from(
+        &self,
+        path: &Path,
+        remote: Option<&str>,
+        cancel: &CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<String> {
+        let target = remote.map_or(sidecar::FetchTarget::All, sidecar::FetchTarget::Remote);
+        sidecar::fetch_streaming(path, target, cancel, on)
+    }
+
+    fn publish_branch_only(
+        &self,
+        path: &Path,
+        remote: &str,
+        cancel: &CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<String> {
+        let branch = {
+            let repo = self.open(path)?;
+            let head = repo.head()?;
+            if !head.is_branch() {
+                return Err(GitEngineError::InvalidOperation(
+                    "Publishing needs a branch (HEAD is detached)".into(),
+                ));
+            }
+            head.shorthand()?.to_string()
+        };
+        // The fork point: the parent of the oldest commit that is on no
+        // remote yet — or HEAD itself when everything is pushed already.
+        let unpushed = ops::HistoryOps::unpushed_commits(self, path)?;
+        let base = match unpushed.last() {
+            None => self.log(path, 0, 1)?.first().map(|c| c.id.clone()),
+            Some(oldest) => oldest.parent_ids.first().cloned(),
+        }
+        .ok_or_else(|| {
+            GitEngineError::InvalidOperation(
+                "No commit of this branch is on a remote yet — publish it with its commits".into(),
+            )
+        })?;
+        let out = sidecar::push_commit_as_branch(path, remote, &base, &branch, cancel, on)?;
+        // A push of a commit id sets no tracking: do it explicitly.
+        sidecar::run_git(
+            path,
+            &[
+                "branch",
+                &format!("--set-upstream-to={remote}/{branch}"),
+                "--",
+                &branch,
+            ],
+        )?;
+        Ok(out)
     }
 
     fn pull_with_progress(
@@ -1306,7 +1352,43 @@ impl crate::ops::RemoteProgressOps for Git2Engine {
         cancel: &CancelToken,
         on: &mut dyn FnMut(tg_domain::GitProgress),
     ) -> Result<String> {
-        sidecar::pull_streaming(path, prune, cancel, on)
+        self.pull_with_strategy(path, prune, None, None, cancel, on)
+    }
+
+    fn pull_with_strategy(
+        &self,
+        path: &Path,
+        prune: bool,
+        strategy: Option<&str>,
+        from: Option<(&str, &str)>,
+        cancel: &CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<String> {
+        let strategy = strategy.map(sidecar::PullStrategy::parse).transpose()?;
+        // A pull.rebase / pull.ff the user set in git wins over the app's
+        // choice — but only in the repo's own or the user's personal (global)
+        // configuration. The SYSTEM level is skipped on purpose: the Git for
+        // Windows installer writes pull.rebase=false there for everyone, which
+        // would silently switch the app's setting off on every Windows machine.
+        let configured = {
+            let repo = self.open(path)?;
+            let config = repo.config()?;
+            [
+                git2::ConfigLevel::Local,
+                git2::ConfigLevel::Global,
+                git2::ConfigLevel::XDG,
+                git2::ConfigLevel::Worktree,
+            ]
+            .into_iter()
+            .filter_map(|level| config.open_level(level).ok())
+            .any(|c| c.get_entry("pull.rebase").is_ok() || c.get_entry("pull.ff").is_ok())
+        };
+        let strategy = if configured && !strategy.is_some_and(sidecar::PullStrategy::is_explicit) {
+            None
+        } else {
+            strategy
+        };
+        sidecar::pull_streaming(path, prune, strategy, from, cancel, on)
     }
 
     fn clone_prepare(&self, url: &str, dest_dir: &Path) -> Result<()> {
@@ -1370,6 +1452,277 @@ impl crate::ops::RemoteProgressOps for Git2Engine {
         };
         drop(repo);
         sidecar::push_to_streaming(path, remote, branch_name.as_deref(), force, cancel, on)
+    }
+}
+
+/// The hooks a commit runs. libgit2 runs none of them, so a repo with any
+/// of them — or with `core.hooksPath` set (husky & co.) — commits through
+/// git.
+const COMMIT_HOOKS: [&str; 4] = [
+    "pre-commit",
+    "prepare-commit-msg",
+    "commit-msg",
+    "post-commit",
+];
+
+/// Where git looks for the hook `name`: in `core.hooksPath` when that is set
+/// (relative to the worktree, as git reads it), else in the common dir's
+/// `hooks`.
+fn hook_path(repo: &Repository, name: &str) -> PathBuf {
+    let configured = repo
+        .config()
+        .and_then(|c| c.get_string("core.hooksPath"))
+        .ok()
+        .filter(|p| !p.trim().is_empty());
+    let dir = match configured {
+        Some(p) => {
+            let p = PathBuf::from(p);
+            match (p.is_absolute(), repo.workdir()) {
+                (false, Some(workdir)) => workdir.join(p),
+                _ => p,
+            }
+        }
+        None => repo.commondir().join("hooks"),
+    };
+    dir.join(name)
+}
+
+/// Whether the hook `name` is in place (see [`hook_path`]).
+pub(crate) fn hook_exists(repo: &Repository, name: &str) -> bool {
+    hook_path(repo, name).is_file()
+}
+
+/// Whether the `pre-push` hook is the one `git lfs install` writes — nothing
+/// but the git-lfs call (plus its "git-lfs missing" guard). Its failures are
+/// LFS upload errors, not a hook of the user's stopping the push.
+pub(crate) fn pre_push_is_git_lfs(repo: &Repository) -> bool {
+    let Ok(text) = std::fs::read_to_string(hook_path(repo, "pre-push")) else {
+        return false;
+    };
+    let code: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    code.iter().any(|l| l.starts_with("git lfs pre-push"))
+        && code
+            .iter()
+            .all(|l| l.starts_with("git lfs pre-push") || l.starts_with("command -v git-lfs"))
+}
+
+fn commit_hooks(repo: &Repository) -> bool {
+    let hooks_path = repo
+        .config()
+        .and_then(|c| c.get_string("core.hooksPath"))
+        .is_ok_and(|p| !p.trim().is_empty());
+    if hooks_path {
+        return true;
+    }
+    let dir = repo.commondir().join("hooks");
+    COMMIT_HOOKS.iter().any(|h| dir.join(h).is_file())
+}
+
+/// A failed `git commit`: the known causes by name; otherwise, with hooks in
+/// place, the hook that stopped it (its output is the detail), and with
+/// signing on, the signature.
+fn commit_error(e: GitEngineError, hooks: bool, signing: bool) -> GitEngineError {
+    let GitEngineError::Sidecar { message } = e else {
+        return e;
+    };
+    let lower = message.to_ascii_lowercase();
+    let (code, text) = if let Some(known) = sidecar::classify_local_error(&message) {
+        known
+    } else if lower.contains("nothing to commit") || lower.contains("no changes added") {
+        return GitEngineError::Sidecar { message };
+    } else if hooks {
+        (
+            "hook_failed",
+            "A git hook stopped the commit — its output is below.".to_string(),
+        )
+    } else if signing {
+        (
+            "signing_failed",
+            "Signing the commit failed — see git's output below.".to_string(),
+        )
+    } else {
+        return GitEngineError::Sidecar { message };
+    };
+    GitEngineError::Remote {
+        code,
+        message: text,
+        raw: message,
+    }
+}
+
+impl Git2Engine {
+    /// [`GitEngine::commit`], optionally without a signature for this one
+    /// commit (`unsigned`, the way out of `signing_failed`).
+    pub fn commit_with(
+        &self,
+        path: &Path,
+        message: &str,
+        amend: bool,
+        unsigned: bool,
+    ) -> Result<String> {
+        if message.trim().is_empty() {
+            return Err(GitEngineError::EmptyCommitMessage);
+        }
+        let mut repo = self.open(path)?;
+
+        // Safety net: an amend is a history rewrite → anchor the old HEAD
+        // beforehand as a durable backup (refs/terra-git/backup/). The volatile
+        // undo stack survives no app restart/gc, a real reference does. Only when
+        // HEAD exists and no merge is running (an amend during a merge is
+        // rejected below anyway) — otherwise a backup would be created that only
+        // masks the actual error.
+        if amend
+            && repo.state() != git2::RepositoryState::Merge
+            && repo.head().and_then(|h| h.peel_to_commit()).is_ok()
+        {
+            crate::ops::create_backup_ref(&repo, "amend")?;
+        }
+
+        // Signed commits (commit.gpgsign=true) go through the system git, which
+        // handles GPG/SSH signing (community request #78) — and so do commits
+        // in a repo with commit hooks, which libgit2 would skip.
+        let signing = !unsigned
+            && repo
+                .config()
+                .and_then(|c| c.get_bool("commit.gpgsign"))
+                .unwrap_or(false);
+        let hooks = commit_hooks(&repo);
+        if signing || hooks {
+            drop(repo);
+            // Exclusive create, 0600 on Unix: a hook may run for minutes, and
+            // other users of a shared /tmp must neither read the message nor
+            // redirect the write.
+            let msg_file = sidecar::write_secure_temp("terra-git-msg", "txt", message.as_bytes())?;
+            let msg_path = msg_file.to_string_lossy().into_owned();
+            let mut args: Vec<&str> = Vec::new();
+            if unsigned {
+                // "Commit once without a signature" after `signing_failed`.
+                args.extend(["-c", "commit.gpgsign=false"]);
+            }
+            args.extend(["commit", "-F", &msg_path]);
+            if amend {
+                args.push("--amend");
+            }
+            // Long timeout: a pre-commit hook may run linters or tests.
+            // English messages whatever the user's language: commit_error reads
+            // git's wording (with a German git a missing identity became
+            // `hook_failed`). Only the message language — the hooks keep the
+            // user's character encoding (LC_CTYPE), unlike with LC_ALL=C.
+            let result =
+                sidecar::run_git_long_env(path, &args, &[("LANGUAGE", "C"), ("LC_MESSAGES", "C")]);
+            let _ = std::fs::remove_file(&msg_file);
+            result.map_err(|e| commit_error(e, hooks, signing))?;
+            let repo = self.open(path)?;
+            let id = repo.head()?.peel_to_commit()?.id().to_string();
+            return Ok(id);
+        }
+
+        let state = repo.state();
+        let merging = state == git2::RepositoryState::Merge;
+        // Cherry-pick/revert (also as a sequence) leave CHERRY_PICK_HEAD/
+        // REVERT_HEAD/.git/sequencer behind — after a successful commit, clean
+        // them up just like the merge state, otherwise "continue" fails afterwards
+        // and "abort" is refused. The commit itself stays a single-parent commit
+        // as before (no MERGE_HEADs in these states).
+        let sequencing = matches!(
+            state,
+            git2::RepositoryState::CherryPick
+                | git2::RepositoryState::CherryPickSequence
+                | git2::RepositoryState::Revert
+                | git2::RepositoryState::RevertSequence
+        );
+        // Collect the MERGE_HEADs right away (needs &mut before borrows appear).
+        let mut merge_oids: Vec<Oid> = Vec::new();
+        if merging {
+            repo.mergehead_foreach(|oid| {
+                merge_oids.push(*oid);
+                true
+            })?;
+        }
+        let sig = repo.signature()?;
+        let mut index = repo.index()?;
+        let tree_id = index.write_tree()?;
+        let tree = repo.find_tree(tree_id)?;
+
+        if amend {
+            // Reject an amend during ANY running multi-step operation, not only
+            // during a merge: otherwise amend() replaces our OWN
+            // predecessor commit with the result of the running operation — the
+            // foreign change lands in our commit, ours is gone, and the operation
+            // state remains. Real git refuses this explicitly ("You are in the
+            // middle of a cherry-pick -- cannot amend"), and the sidecar path
+            // passes exactly that error through; only the git2 path did it
+            // silently. On a merge it would additionally produce a falsified
+            // merge parent.
+            if state != git2::RepositoryState::Clean {
+                return Err(GitEngineError::Sidecar {
+                    message: "Cannot amend while an operation is in progress — continue or abort it first"
+                        .into(),
+                });
+            }
+            // Only "no commit present" is NothingToAmend; real errors (corrupt
+            // refs, I/O) are passed through with their cause.
+            let head_commit = match repo.head().and_then(|h| h.peel_to_commit()) {
+                Ok(c) => c,
+                Err(e) if is_unborn(&e) => return Err(GitEngineError::NothingToAmend),
+                Err(e) => return Err(e.into()),
+            };
+            let new_id =
+                head_commit.amend(Some("HEAD"), None, None, None, Some(message), Some(&tree))?;
+            return Ok(new_id.to_string());
+        }
+
+        // Parents: HEAD + all MERGE_HEADs during a running merge (merge commit!).
+        // Without that, a commit after a conflicted pull would not record the
+        // remote history as merged.
+        let mut parents_owned: Vec<git2::Commit<'_>> = Vec::new();
+        match repo.head() {
+            Ok(head) => parents_owned.push(head.peel_to_commit()?),
+            Err(e) if is_unborn(&e) => {}
+            Err(e) => return Err(e.into()),
+        }
+        for oid in merge_oids {
+            parents_owned.push(repo.find_commit(oid)?);
+        }
+        // Author vs. committer: on a cherry-pick a foreign commit TRAVELS — its
+        // authorship still belongs to the original, only the committer is whoever
+        // finishes the pick. That is exactly how `git commit` behaves when
+        // finishing a conflicted cherry-pick (verified empirically), and so does
+        // the sidecar path (commit.gpgsign) and the banner button
+        // (`cherry-pick --continue`) — the git2 path was the only one that
+        // silently replaced the foreign authorship with our own and deleted the
+        // source (CHERRY_PICK_HEAD) with cleanup_state() on top.
+        //
+        // Not so for a REVERT: there a new commit is created that takes the change
+        // back — its author is whoever reverts. Also just like git.
+        let author = if matches!(
+            state,
+            git2::RepositoryState::CherryPick | git2::RepositoryState::CherryPickSequence
+        ) {
+            crate::ops::gitdir_oid(&repo, "CHERRY_PICK_HEAD")
+                .and_then(|oid| repo.find_commit(oid).ok())
+                .map(|c| c.author().to_owned())
+                .unwrap_or_else(|| sig.to_owned())
+        } else {
+            sig.to_owned()
+        };
+        let id = {
+            let parents: Vec<&git2::Commit<'_>> = parents_owned.iter().collect();
+            repo.commit(Some("HEAD"), &author, &sig, message, &tree, &parents)?
+        };
+        if merging || sequencing {
+            // Release the borrows, then clean up MERGE_HEAD/MERGE_MSG or
+            // CHERRY_PICK_HEAD/REVERT_HEAD/sequencer — otherwise the repo stays
+            // "in a merge"/"in a cherry-pick" as far as git is concerned.
+            drop(parents_owned);
+            drop(tree);
+            repo.cleanup_state()?;
+        }
+        Ok(id.to_string())
     }
 }
 
@@ -1462,5 +1815,32 @@ mod fast_path_tests {
         assert!(st.branch.is_some());
         assert_eq!(st.upstream, None);
         assert_eq!(st.ahead, 2, "ahead has to count the unpublished commits");
+    }
+}
+
+#[cfg(test)]
+mod hook_tests {
+    use super::pre_push_is_git_lfs;
+
+    #[test]
+    fn the_hook_git_lfs_installs_is_told_apart_from_the_users_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = git2::Repository::init(dir.path()).unwrap();
+        let hooks = repo.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        let hook = hooks.join("pre-push");
+        // What `git lfs install` writes.
+        std::fs::write(
+            &hook,
+            "#!/bin/sh\ncommand -v git-lfs >/dev/null 2>&1 || { printf >&2 \"\\n%s\\n\\n\" \
+             \"git-lfs missing\"; exit 2; }\ngit lfs pre-push \"$@\"\n",
+        )
+        .unwrap();
+        assert!(pre_push_is_git_lfs(&repo));
+        // A hook of the user's own — also one that calls git-lfs — is named.
+        std::fs::write(&hook, "#!/bin/sh\nnpm test\ngit lfs pre-push \"$@\"\n").unwrap();
+        assert!(!pre_push_is_git_lfs(&repo));
+        std::fs::remove_file(&hook).unwrap();
+        assert!(!pre_push_is_git_lfs(&repo));
     }
 }

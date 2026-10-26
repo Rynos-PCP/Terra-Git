@@ -60,6 +60,11 @@ const tables: Record<Lang, Partial<Record<MessageKey, string>>> = { de, en };
  * Codes whose messages carry details (paths, branch names) deliberately have NO
  * entry — the backend's original message stays there.
  */
+/** Whether the catalogs know `key` (the German one is the reference). */
+export function hasMessage(key: string): boolean {
+  return key in de;
+}
+
 export function resolveErrorMessage(code: string | undefined, fallback: string): string {
   const key = `err.${code}`;
   if (code && key in de) {

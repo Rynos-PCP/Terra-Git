@@ -114,13 +114,15 @@
     return !!first && first.action !== "pick" && first.action !== "reword";
   });
   const allDropped = $derived(rows.every((r) => r.action === "drop"));
+  // Down to the very first commit (empty base): git cannot rebase onto nothing.
+  const allDroppedToRoot = $derived(allDropped && !baseId);
   const kept = $derived(rows.filter((r) => r.action !== "drop").length);
   const rewordEmpty = $derived(
     rows.some((r) => r.action === "reword" && r.message.trim().length === 0),
   );
 
   async function run() {
-    if (submitting || firstKeptIsSquash || rewordEmpty) return;
+    if (submitting || firstKeptIsSquash || rewordEmpty || allDroppedToRoot) return;
     submitting = true;
     const steps: RebaseStep[] = rows.map((r) => ({
       action: r.action,
@@ -209,13 +211,19 @@
     <p class="warn">{t("rebase.warnFirstSquash")}</p>
   {:else if rewordEmpty}
     <p class="warn">{t("rebase.warnRewordEmpty")}</p>
+  {:else if allDroppedToRoot}
+    <p class="warn">{t("rebase.warnAllDroppedRoot")}</p>
   {:else if allDropped}
     <p class="warn">{t("rebase.warnAllDropped")}</p>
   {/if}
 
   <div class="actions">
     <button onclick={onclose}>{t("common.cancel")}</button>
-    <button class="primary" disabled={submitting || firstKeptIsSquash || rewordEmpty} onclick={run}>
+    <button
+      class="primary"
+      disabled={submitting || firstKeptIsSquash || rewordEmpty || allDroppedToRoot}
+      onclick={run}
+    >
       {#if submitting}<span class="spin"></span>{/if}
       {tn("rebase.run", kept)}
     </button>

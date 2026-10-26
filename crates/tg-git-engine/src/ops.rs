@@ -10,14 +10,15 @@ use std::path::Path;
 use base64::Engine as _;
 use git2::{BranchType, ErrorCode, Oid, RepositoryState, ResetType};
 
+use crate::discarded;
 use crate::error::{GitEngineError, Result};
 use crate::sidecar::{self, literal_pathspec};
 use crate::{is_unborn, Git2Engine, GitEngine};
 use tg_domain::{
-    BackupInfo, BlameLine, CloneOptions, CommitInfo, EolStyle, FileLineStats, ImageDiff,
-    RemoteInfo, RepoInfo, RepoOpState, RepoSketch, ResetMode, SketchBranch, SketchCommit,
-    SparseStatus, StashInfo, SubmoduleInfo, TagInfo, UnchangedInfo, UnchangedReason, UndoAction,
-    UnpushedCommit, WorktreeInfo,
+    BackupInfo, BlameLine, CloneOptions, CommitInfo, DiscardedInfo, EolStyle, FileLineStats,
+    ImageDiff, ReflogEntry, RemoteInfo, RepoInfo, RepoOpState, RepoSketch, ResetMode, SketchBranch,
+    SketchCommit, SparseStatus, StashApplyOutcome, StashInfo, SubmoduleInfo, TagInfo,
+    UnchangedInfo, UnchangedReason, UndoAction, UnpushedCommit, WorktreeInfo,
 };
 
 /// Detects the line-ending style of a text content.
@@ -201,8 +202,13 @@ pub trait StashOps {
     fn stash_list(&self, path: &Path) -> Result<Vec<StashInfo>>;
     /// Create a stash; empty `files` = everything, otherwise a partial stash (request #11531).
     fn stash_push(&self, path: &Path, message: &str, files: &[String]) -> Result<String>;
-    fn stash_apply(&self, path: &Path, index: usize) -> Result<()>;
-    fn stash_pop(&self, path: &Path, index: usize) -> Result<()>;
+    /// Re-applies a stash and keeps it. Conflicts are reported, not raised:
+    /// libgit2 writes the markers into a clean worktree and returns success.
+    fn stash_apply(&self, path: &Path, index: usize) -> Result<StashApplyOutcome>;
+    /// Like `stash_apply`, but drops the stash — ONLY if nothing is in
+    /// conflict. On conflicts the stash stays, so nothing is lost until the
+    /// user has resolved them (libgit2's own pop drops unconditionally).
+    fn stash_pop(&self, path: &Path, index: usize) -> Result<StashApplyOutcome>;
     fn stash_drop(&self, path: &Path, index: usize) -> Result<()>;
 }
 
@@ -219,6 +225,9 @@ pub trait BranchOps {
     fn delete_branch(&self, path: &Path, name: &str, force: bool) -> Result<()>;
     /// Merges `name` into the current branch (sidecar; conflicts -> merge state).
     fn merge_branch(&self, path: &Path, name: &str) -> Result<String>;
+    /// Like [`merge_branch`](Self::merge_branch), joining two histories
+    /// without a common commit (`--allow-unrelated-histories`).
+    fn merge_unrelated(&self, path: &Path, name: &str) -> Result<String>;
     /// Rebases the current branch onto `name` (sidecar).
     fn rebase_onto(&self, path: &Path, name: &str) -> Result<String>;
 }
@@ -237,6 +246,11 @@ pub trait ConflictOps {
     fn read_conflict(&self, path: &Path, file: &str) -> Result<tg_domain::ConflictFile>;
     /// Writes the resolved content into the file and stages it.
     fn save_resolution(&self, path: &Path, file: &str, content: &str) -> Result<()>;
+    /// Gives up conflicts that belong to NO running operation (e.g. a stash
+    /// applied with conflicts): the files go back to their HEAD
+    /// state — or away, if HEAD does not have them — after a copy into the
+    /// discard store (`limit_bytes`). Returns the snapshot name.
+    fn abandon_conflicts(&self, path: &Path, files: &[String], limit_bytes: u64) -> Result<String>;
 }
 
 /// History surgery (cherry-pick/revert/squash/interactive rebase) + undo executor.
@@ -247,7 +261,8 @@ pub trait HistoryOps {
     fn undo_last_commit(&self, path: &Path) -> Result<()>;
     /// Squashes all commits from `oldest_id` up to HEAD into one new commit.
     /// `oldest_id` is the oldest commit to include (its base is that commit's
-    /// first parent). Transactional: on error HEAD stays unchanged.
+    /// first parent — or none, when it is the root commit: the result is then a
+    /// new root commit). Transactional: on error HEAD stays unchanged.
     fn squash_from(&self, path: &Path, oldest_id: &str, message: &str) -> Result<String>;
     fn create_branch_from_commit(
         &self,
@@ -258,7 +273,46 @@ pub trait HistoryOps {
     ) -> Result<()>;
     fn checkout_commit(&self, path: &Path, commit_id: &str) -> Result<()>;
     fn search_log(&self, path: &Path, query: &str, limit: usize) -> Result<Vec<CommitInfo>>;
+    /// The branch HEAD points at while it has no commit yet ("unborn" — a
+    /// fresh repo or after undoing the first commit); `None` otherwise.
+    fn unborn_branch(&self, path: &Path) -> Result<Option<String>>;
+    /// How many commits `to` has that `from` has not (`git rev-list --count
+    /// from..to`), capped at 100,000.
+    fn count_commits(&self, path: &Path, from: &str, to: &str) -> Result<u32>;
+    /// The repository's default branch: the remote's HEAD (`origin/main`), or
+    /// a local `main`/`master` when there is none.
+    fn default_branch(&self, path: &Path) -> Result<Option<String>>;
+    /// The reflog of `reference` (`HEAD` or `refs/heads/<branch>`), newest
+    /// first, at most `limit` entries.
+    fn reflog(&self, path: &Path, reference: &str, limit: usize) -> Result<Vec<ReflogEntry>>;
+    /// Moves the current branch to `commit`. A backup ref is
+    /// written first; a hard reset copies uncommitted changes into the discard
+    /// store before they are overwritten (`limit_bytes`). Returns the snapshot
+    /// name if one was taken.
+    fn reset_to(
+        &self,
+        path: &Path,
+        commit: &str,
+        mode: ResetMode,
+        limit_bytes: u64,
+    ) -> Result<Option<String>>;
+    /// Commits reachable from `to` but not from `from`, newest first.
+    fn log_range(&self, path: &Path, from: &str, to: &str, limit: usize)
+        -> Result<Vec<CommitInfo>>;
+    /// Streams the diff between two commits/refs (tree `from` → tree `to`).
+    fn range_diff_stream(
+        &self,
+        path: &Path,
+        from: &str,
+        to: &str,
+        max_files: usize,
+        sink: &mut dyn FnMut(tg_domain::FileDiff) -> bool,
+    ) -> Result<usize>;
+    /// The best common ancestor of two commits/refs.
+    fn merge_base(&self, path: &Path, a: &str, b: &str) -> Result<String>;
     /// Interactive rebase of the range `base_id..HEAD` according to `steps`
+    /// (an EMPTY `base_id` rewrites the whole history from the root commit on,
+    /// `git rebase -i --root`)
     /// (order = the new order of application, oldest first). Strictly validated
     /// against data loss: the step set has to match the range exactly, no merges,
     /// and the first non-drop action has to be `pick`. On conflicts the repo
@@ -309,6 +363,16 @@ pub trait StagingOps {
     fn apply_hunk(&self, path: &Path, file: &str, hunk_index: usize, unstage: bool) -> Result<()>;
     /// Discards a single hunk in the workdir.
     fn discard_hunk(&self, path: &Path, file: &str, hunk_index: usize) -> Result<()>;
+    /// Stages like [`GitEngine::stage`]; large sets report `staging` progress
+    /// with a file counter and stop on `cancel`. The index is written only at
+    /// the end, so a cancelled run stages nothing.
+    fn stage_with_progress(
+        &self,
+        path: &Path,
+        files: &[String],
+        cancel: &crate::CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<()>;
     /// Stages/unstages selected lines (indices into the hunk's body lines).
     fn apply_lines(
         &self,
@@ -343,6 +407,38 @@ pub trait BackupOps {
     fn restore_backup(&self, path: &Path, ref_name: &str) -> Result<String>;
     /// Removes a backup.
     fn delete_backup(&self, path: &Path, ref_name: &str) -> Result<()>;
+}
+
+/// Recoverable discard: every discard first snapshots what it
+/// is about to throw away, see [`crate::discarded`].
+pub trait DiscardOps {
+    /// Discards like [`GitEngine::discard`], after copying ALL affected files
+    /// into the discard store. If the copy does not fit next to the snapshots
+    /// already kept (`limit_bytes`), nothing is discarded (`DiscardStoreFull`).
+    /// Returns the snapshot name.
+    fn discard_protected(&self, path: &Path, files: &[String], limit_bytes: u64) -> Result<String>;
+    /// Discards one hunk like [`StagingOps::discard_hunk`], after a snapshot of
+    /// the file (same limit rule).
+    fn discard_hunk_protected(
+        &self,
+        path: &Path,
+        file: &str,
+        hunk_index: usize,
+        limit_bytes: u64,
+    ) -> Result<String>;
+    /// All snapshots, newest first, with their size on disk.
+    fn discarded(&self, path: &Path) -> Result<Vec<DiscardedInfo>>;
+    /// Writes the state before the discard back. Files changed since are
+    /// reported (`DiscardRestoreConflict`) unless `force`.
+    fn restore_discarded(
+        &self,
+        path: &Path,
+        name: &str,
+        force: bool,
+        limit_bytes: u64,
+    ) -> Result<()>;
+    /// Removes a snapshot.
+    fn delete_discarded(&self, path: &Path, name: &str) -> Result<()>;
 }
 
 /// Repo lifecycle (init/ignore). Cloning runs exclusively in two phases through
@@ -418,6 +514,36 @@ pub trait RemoteProgressOps {
         cancel: &crate::CancelToken,
         on: &mut dyn FnMut(tg_domain::GitProgress),
     ) -> Result<String>;
+    /// Pull with an explicit strategy (merge / rebase / fast-forward only) —
+    /// unless the repository's or the user's git config sets `pull.rebase` or
+    /// `pull.ff` itself: that choice wins.
+    fn pull_with_strategy(
+        &self,
+        path: &Path,
+        prune: bool,
+        strategy: Option<&str>,
+        from: Option<(&str, &str)>,
+        cancel: &crate::CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<String>;
+    /// Fetch from one named remote, or from all of them (`remote = None`).
+    fn fetch_from(
+        &self,
+        path: &Path,
+        remote: Option<&str>,
+        cancel: &crate::CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<String>;
+    /// Publishes the current branch WITHOUT its unpushed commits: pushes the
+    /// newest commit that is already on a remote as the new branch and sets
+    /// the upstream. The commits follow with a normal push.
+    fn publish_branch_only(
+        &self,
+        path: &Path,
+        remote: &str,
+        cancel: &crate::CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<String>;
     /// Clone stage 1: create the target folder, `git init` + `origin` remote (no network).
     fn clone_prepare(&self, url: &str, dest_dir: &Path) -> Result<()>;
     /// Clone stage 2: fetch the data + check out the default branch (with progress).
@@ -459,6 +585,7 @@ pub trait GitEngineExt:
     + StagingOps
     + RemoteOps
     + BackupOps
+    + DiscardOps
     + RepoLifecycleOps
     + ViewOps
     + WorktreeOps
@@ -479,6 +606,7 @@ impl<T> GitEngineExt for T where
         + StagingOps
         + RemoteOps
         + BackupOps
+        + DiscardOps
         + RepoLifecycleOps
         + ViewOps
         + WorktreeOps
@@ -493,9 +621,9 @@ impl<T> GitEngineExt for T where
 /// even though the methods now live on several traits.
 pub mod prelude {
     pub use super::{
-        BackupOps, BisectOps, BranchOps, ConfigOps, ConflictOps, GitEngineExt, HistoryOps,
-        RemoteOps, RemoteProgressOps, RepoLifecycleOps, SparseOps, StagingOps, StashOps, TagOps,
-        ViewOps, WorktreeOps,
+        BackupOps, BisectOps, BranchOps, ConfigOps, ConflictOps, DiscardOps, GitEngineExt,
+        HistoryOps, RemoteOps, RemoteProgressOps, RepoLifecycleOps, SparseOps, StagingOps,
+        StashOps, TagOps, ViewOps, WorktreeOps,
     };
     pub use crate::{Git2Engine, GitEngine};
 }
@@ -603,6 +731,15 @@ fn config_remove(config: &mut git2::Config, key: &str) -> Result<()> {
     }
 }
 
+/// The only keys `config_set` writes (lower case): the identity and signing
+/// settings and the long-paths way out of `path_too_long`.
+const SETTABLE_CONFIG_KEYS: &[&str] = &[
+    "user.name",
+    "user.email",
+    "commit.gpgsign",
+    "core.longpaths",
+];
+
 /// Refuses git config keys whose value executes a COMMAND during later git
 /// operations (command-injection/RCE surface). The `config_set` command is only
 /// reachable from our own webview (deny-by-default, strict CSP), but this
@@ -701,6 +838,83 @@ fn validate_commit_hex(commit: &str) -> Result<()> {
     }
 }
 
+/// Uncommitted work as git sees it — staged and unstaged changes (both sides
+/// of a rename), untracked files left out. Through the engine's status: in a
+/// repository with filter drivers (LFS) that is git's own status, where
+/// libgit2 would report every filtered file as modified.
+fn uncommitted_paths(engine: &Git2Engine, path: &Path) -> Result<Vec<String>> {
+    let st = engine.status(path)?;
+    let mut out: Vec<String> = st
+        .staged
+        .iter()
+        .chain(st.unstaged.iter())
+        .filter(|e| e.kind != tg_domain::ChangeKind::Untracked)
+        .flat_map(|e| std::iter::once(e.path.clone()).chain(e.orig_path.clone()))
+        .collect();
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// What a hard reset to `target` overwrites without git saying a word:
+/// untracked or ignored files at paths the target commit holds and the index
+/// does not — plus files standing where the target needs a folder. `git reset
+/// --hard` replaces them silently; none of them is in any commit.
+fn overwritten_untracked(
+    repo: &git2::Repository,
+    workdir: &Path,
+    target: &git2::Tree,
+) -> Result<Vec<String>> {
+    let index = repo.index()?;
+    let diff = repo.diff_tree_to_index(Some(target), Some(&index), None)?;
+    let target_only: Vec<String> = diff
+        .deltas()
+        .filter(|d| d.status() == git2::Delta::Deleted)
+        .filter_map(|d| {
+            d.old_file()
+                .path()
+                .and_then(|p| p.to_str())
+                .map(str::to_string)
+        })
+        .collect();
+    let mut out: Vec<String> = target_only
+        .iter()
+        .filter(|p| {
+            workdir
+                .join(p.as_str())
+                .symlink_metadata()
+                .is_ok_and(|md| !md.is_dir())
+        })
+        .cloned()
+        .collect();
+    out.extend(discarded::blocking_ancestors(workdir, &target_only));
+    out.sort();
+    out.dedup();
+    Ok(out)
+}
+
+/// Refuses a hard reset that would overwrite untracked or ignored files
+/// ([`overwritten_untracked`]) — for the resets that keep no copy.
+fn refuse_overwritten_untracked(repo: &git2::Repository, target: &git2::Commit) -> Result<()> {
+    let workdir = discard_workdir(repo)?;
+    let files = overwritten_untracked(repo, &workdir, &target.tree()?)?;
+    if files.is_empty() {
+        return Ok(());
+    }
+    let shown: Vec<&str> = files.iter().take(5).map(String::as_str).collect();
+    let more = files.len().saturating_sub(shown.len());
+    Err(GitEngineError::InvalidOperation(format!(
+        "Files that are not under version control would be overwritten: {}{} — \
+         move them away first.",
+        shown.join(", "),
+        if more > 0 {
+            format!(" and {more} more")
+        } else {
+            String::new()
+        }
+    )))
+}
+
 /// Checks whether index AND workdir (untracked excluded) match the tree of
 /// `commit` exactly. Then a hard reset there discards no uncommitted changes —
 /// the case "redo of a commit right after its soft undo": the staged changes ARE
@@ -736,6 +950,145 @@ pub fn image_mime(file: &str) -> Option<&'static str> {
         "ico" => Some("image/x-icon"),
         "svg" => Some("image/svg+xml"),
         _ => None,
+    }
+}
+
+/// Paths in conflict in the index (each once, sorted). Reads the index fresh
+/// from disk, so it sees what an operation just wrote.
+/// `git merge` of `name` into the current branch. English messages +
+/// classification: local changes in the way, conflicts and unrelated
+/// histories come back as stable codes.
+fn merge_with(path: &Path, name: &str, unrelated: bool) -> Result<String> {
+    let target = safe_ref(path, name)?;
+    let mut args = vec![CONFLICT_STYLE[0], CONFLICT_STYLE[1], "merge", "--no-edit"];
+    if unrelated {
+        args.push("--allow-unrelated-histories");
+    }
+    args.push(&target);
+    sidecar::classified(sidecar::run_git_long_env(path, &args, &[("LC_ALL", "C")]))
+}
+
+/// Applies stash `index` without dropping it. In a repo with filter drivers
+/// (Git LFS) through `git stash apply`, which runs the smudge filter — libgit2
+/// would leave LFS pointers in place of changed files. Conflicts are no
+/// error here: the caller reads them from the index. Returns a fresh handle.
+fn apply_stash(mut repo: git2::Repository, path: &Path, index: usize) -> Result<git2::Repository> {
+    if !crate::lfs::declares_filters(&repo) {
+        repo.stash_apply(index, None)?;
+        return Ok(repo);
+    }
+    drop(repo);
+    let stash = format!("stash@{{{index}}}");
+    let applied = sidecar::run_git_long(path, &["stash", "apply", &stash]);
+    let repo = git2::Repository::discover(path)?;
+    match applied {
+        Err(_) if !conflicted_paths(&repo)?.is_empty() => Ok(repo),
+        Err(e) => Err(e),
+        Ok(_) => Ok(repo),
+    }
+}
+
+fn conflicted_paths(repo: &git2::Repository) -> Result<Vec<String>> {
+    let mut index = repo.index()?;
+    index.read(true)?;
+    let mut paths = std::collections::BTreeSet::new();
+    for conflict in index.conflicts()? {
+        let conflict = conflict?;
+        // One of the three sides is always present; a deleted side has no entry.
+        if let Some(entry) = conflict.our.or(conflict.their).or(conflict.ancestor) {
+            paths.insert(String::from_utf8_lossy(&entry.path).into_owned());
+        }
+    }
+    Ok(paths.into_iter().collect())
+}
+
+/// Short name of the branch HEAD points at (also while unborn); an error on a
+/// detached HEAD — "back to no commit" needs a branch to empty.
+fn current_branch_name(repo: &git2::Repository) -> Result<String> {
+    let head = repo.find_reference("HEAD")?;
+    let target = head
+        .symbolic_target()
+        .ok()
+        .flatten()
+        .and_then(|t| t.strip_prefix("refs/heads/").map(str::to_string));
+    target.ok_or_else(|| GitEngineError::InvalidOperation("Not possible on a detached HEAD".into()))
+}
+
+/// Deletes the branch ref without the root-commit checks (squash to a new
+/// root, which replaces a whole range).
+fn uncommit_root_unchecked(repo: &git2::Repository, branch: &str) -> Result<()> {
+    let mut reference = repo.find_reference(&format!("refs/heads/{branch}"))?;
+    delete_keeping_reflog(repo, &mut reference, branch)
+}
+
+/// Deletes the branch ref but keeps its reflog: libgit2 removes
+/// `logs/refs/heads/<branch>` together with the ref, and the Reflog view would
+/// lose the branch's whole history. git appends to the kept file once the
+/// branch has a commit again.
+fn delete_keeping_reflog(
+    repo: &git2::Repository,
+    reference: &mut git2::Reference,
+    branch: &str,
+) -> Result<()> {
+    let log = repo
+        .commondir()
+        .join("logs")
+        .join("refs")
+        .join("heads")
+        .join(branch);
+    let kept = std::fs::read(&log).ok();
+    reference.delete()?;
+    if let Some(bytes) = kept {
+        if let Some(parent) = log.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&log, bytes)?;
+    }
+    Ok(())
+}
+
+/// Takes `branch` back to "no commit yet": deletes its ref while HEAD keeps
+/// pointing at it. Index and worktree are untouched, so the commit's content
+/// shows up as staged. Guarded: HEAD has to be on `branch`,
+/// the branch on `expected` (the root commit) — otherwise `UndoStale`.
+fn uncommit_root(repo: &git2::Repository, branch: &str, expected: &str) -> Result<()> {
+    if current_branch_name(repo)? != branch {
+        return Err(GitEngineError::InvalidOperation(format!(
+            "Undo is only possible on the original branch: {branch}"
+        )));
+    }
+    let mut reference = repo.find_reference(&format!("refs/heads/{branch}"))?;
+    let tip = reference.peel_to_commit()?;
+    if tip.id().to_string() != expected {
+        return Err(GitEngineError::UndoStale);
+    }
+    if tip.parent_count() != 0 {
+        return Err(GitEngineError::InvalidOperation(
+            "Only the very first commit can be taken back to an empty branch".into(),
+        ));
+    }
+    drop(tip);
+    delete_keeping_reflog(repo, &mut reference, branch)
+}
+
+/// `-c merge.conflictStyle=diff3` for every git call that can leave conflict
+/// markers: the conflict workshop then always gets the common base as a third
+/// column, whatever the user configured. diff3, not zdiff3:
+/// every git version knows it.
+const CONFLICT_STYLE: [&str; 2] = ["-c", "merge.conflictStyle=diff3"];
+
+/// libgit2 writes stash conflicts without the base. git can render them again
+/// from the index stages, this time with the base. Best effort:
+/// the plain markers stay if it fails.
+fn rewrite_markers_with_base(path: &Path, files: &[String]) {
+    if files.is_empty() {
+        return;
+    }
+    let mut args: Vec<String> = vec!["checkout".into(), "--conflict=diff3".into(), "--".into()];
+    args.extend(files.iter().map(|f| literal_pathspec(f)));
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    if let Err(e) = sidecar::run_git(path, &refs) {
+        tracing::warn!("could not rewrite the conflict markers with the base: {e}");
     }
 }
 
@@ -926,9 +1279,36 @@ fn build_partial_hunk(hunk: &str, line_indices: &[usize], reverse: bool) -> Resu
 }
 
 impl Git2Engine {
+    /// Squash down to the root: empty the branch (HEAD unborn, index = the
+    /// tree of `head_id` stays) and commit the index as the new root commit.
+    /// On a failed commit the branch goes back to `head_id`.
+    fn squash_into_new_root(
+        &self,
+        path: &Path,
+        branch: &str,
+        head_id: Oid,
+        message: &str,
+    ) -> Result<String> {
+        {
+            let repo = self.open_repo_at(path)?;
+            uncommit_root_unchecked(&repo, branch)?;
+        }
+        match self.commit(path, message, false) {
+            Ok(id) => Ok(id),
+            Err(e) => {
+                if let Ok(repo) = self.open_repo_at(path) {
+                    if let Ok(commit) = repo.find_commit(head_id) {
+                        let _ = repo.branch(branch, &commit, true);
+                    }
+                }
+                Err(e)
+            }
+        }
+    }
+
     fn open_repo_at(&self, path: &Path) -> Result<git2::Repository> {
-        let repo = git2::Repository::discover(path)
-            .map_err(|_| GitEngineError::NotARepository(path.display().to_string()))?;
+        let repo =
+            git2::Repository::discover(path).map_err(|e| crate::error::open_error(path, e))?;
         // Same rejection as in the core trait (Git2Engine::open): bare repos have
         // no workdir, and all ext operations would otherwise return confusing errors.
         if repo.is_bare() {
@@ -1089,16 +1469,29 @@ impl StashOps for Git2Engine {
         sidecar::run_git_long(path, &arg_refs)
     }
 
-    fn stash_apply(&self, path: &Path, index: usize) -> Result<()> {
-        let mut repo = self.open_repo_at(path)?;
-        repo.stash_apply(index, None)?;
-        Ok(())
+    fn stash_apply(&self, path: &Path, index: usize) -> Result<StashApplyOutcome> {
+        let repo = apply_stash(self.open_repo_at(path)?, path, index)?;
+        let conflicted = conflicted_paths(&repo)?;
+        rewrite_markers_with_base(path, &conflicted);
+        Ok(StashApplyOutcome {
+            conflicted,
+            dropped: false,
+        })
     }
 
-    fn stash_pop(&self, path: &Path, index: usize) -> Result<()> {
-        let mut repo = self.open_repo_at(path)?;
-        repo.stash_pop(index, None)?;
-        Ok(())
+    fn stash_pop(&self, path: &Path, index: usize) -> Result<StashApplyOutcome> {
+        // Never `repo.stash_pop`: it drops even when the apply left conflicts.
+        let mut repo = apply_stash(self.open_repo_at(path)?, path, index)?;
+        let conflicted = conflicted_paths(&repo)?;
+        rewrite_markers_with_base(path, &conflicted);
+        let dropped = conflicted.is_empty();
+        if dropped {
+            repo.stash_drop(index)?;
+        }
+        Ok(StashApplyOutcome {
+            conflicted,
+            dropped,
+        })
     }
 
     fn stash_drop(&self, path: &Path, index: usize) -> Result<()> {
@@ -1218,8 +1611,11 @@ impl BranchOps for Git2Engine {
     }
 
     fn merge_branch(&self, path: &Path, name: &str) -> Result<String> {
-        let target = safe_ref(path, name)?;
-        sidecar::run_git_long(path, &["merge", "--no-edit", &target])
+        merge_with(path, name, false)
+    }
+
+    fn merge_unrelated(&self, path: &Path, name: &str) -> Result<String> {
+        merge_with(path, name, true)
     }
 
     fn rebase_onto(&self, path: &Path, name: &str) -> Result<String> {
@@ -1228,7 +1624,11 @@ impl BranchOps for Git2Engine {
             let repo = self.open_repo_at(path)?;
             create_backup_ref(&repo, "rebase")?;
         }
-        sidecar::run_git_long(path, &["rebase", &target])
+        sidecar::classified(sidecar::run_git_long_env(
+            path,
+            &[CONFLICT_STYLE[0], CONFLICT_STYLE[1], "rebase", &target],
+            &[("LC_ALL", "C")],
+        ))
     }
 }
 
@@ -1381,9 +1781,23 @@ impl ConflictOps for Git2Engine {
     fn continue_operation(&self, path: &Path) -> Result<String> {
         match self.op_state(path)? {
             RepoOpState::Merge => sidecar::run_git_long(path, &["merge", "--continue"]),
-            RepoOpState::Rebase => sidecar::run_git_long(path, &["rebase", "--continue"]),
-            RepoOpState::Cherrypick => sidecar::run_git_long(path, &["cherry-pick", "--continue"]),
-            RepoOpState::Revert => sidecar::run_git_long(path, &["revert", "--continue"]),
+            RepoOpState::Rebase => sidecar::run_git_long(
+                path,
+                &[CONFLICT_STYLE[0], CONFLICT_STYLE[1], "rebase", "--continue"],
+            ),
+            RepoOpState::Cherrypick => sidecar::run_git_long(
+                path,
+                &[
+                    CONFLICT_STYLE[0],
+                    CONFLICT_STYLE[1],
+                    "cherry-pick",
+                    "--continue",
+                ],
+            ),
+            RepoOpState::Revert => sidecar::run_git_long(
+                path,
+                &[CONFLICT_STYLE[0], CONFLICT_STYLE[1], "revert", "--continue"],
+            ),
             RepoOpState::Bisect => Err(GitEngineError::InvalidOperation(
                 "Bisect has no continue — mark good/bad/skip".into(),
             )),
@@ -1399,6 +1813,36 @@ impl ConflictOps for Git2Engine {
         sidecar::run_git(path, &["checkout", side, "--", &literal])?;
         sidecar::run_git(path, &["add", "--", &literal])?;
         Ok(())
+    }
+
+    fn abandon_conflicts(&self, path: &Path, files: &[String], limit_bytes: u64) -> Result<String> {
+        let repo = self.open_repo_at(path)?;
+        if repo.state() != RepositoryState::Clean {
+            return Err(GitEngineError::InvalidOperation(
+                "A running operation is aborted with its own Abort".into(),
+            ));
+        }
+        let workdir = discard_workdir(&repo)?;
+        discarded::ensure_room(
+            &repo,
+            discarded::estimate(&repo, &workdir, files),
+            limit_bytes,
+        )?;
+        let name = discarded::begin(&repo, &workdir, "overwrite", files)?;
+        let head_tree = repo.head().ok().and_then(|h| h.peel_to_tree().ok());
+        for file in files {
+            let literal = literal_pathspec(file);
+            let in_head = head_tree
+                .as_ref()
+                .is_some_and(|t| t.get_path(Path::new(file)).is_ok());
+            if in_head {
+                sidecar::run_git(path, &["checkout", "HEAD", "--", &literal])?;
+            } else {
+                sidecar::run_git(path, &["rm", "-f", "-q", "--", &literal])?;
+            }
+        }
+        discarded::finish(&repo, &workdir, &name)?;
+        Ok(name)
     }
 
     fn read_conflict(&self, path: &Path, file: &str) -> Result<tg_domain::ConflictFile> {
@@ -1446,12 +1890,24 @@ impl HistoryOps for Git2Engine {
     fn cherry_pick(&self, path: &Path, commit_id: &str) -> Result<String> {
         // Oid::from_str validates the hex SHA -> never interpretable as an option.
         let oid = Oid::from_str(commit_id)?.to_string();
-        sidecar::run_git_long(path, &["cherry-pick", &oid])
+        sidecar::run_git_long(
+            path,
+            &[CONFLICT_STYLE[0], CONFLICT_STYLE[1], "cherry-pick", &oid],
+        )
     }
 
     fn revert_commit(&self, path: &Path, commit_id: &str) -> Result<String> {
         let oid = Oid::from_str(commit_id)?.to_string();
-        sidecar::run_git_long(path, &["revert", "--no-edit", &oid])
+        sidecar::run_git_long(
+            path,
+            &[
+                CONFLICT_STYLE[0],
+                CONFLICT_STYLE[1],
+                "revert",
+                "--no-edit",
+                &oid,
+            ],
+        )
     }
 
     fn undo_last_commit(&self, path: &Path) -> Result<()> {
@@ -1470,9 +1926,14 @@ impl HistoryOps for Git2Engine {
                 "A merge commit cannot be undone via uncommit".into(),
             ));
         }
-        let parent = head.parent(0).map_err(|_| {
-            GitEngineError::InvalidOperation("The first commit cannot be undone".into())
-        })?;
+        if head.parent_count() == 0 {
+            // The very first commit: back to "no commit yet".
+            let branch = current_branch_name(&repo)?;
+            let id = head.id().to_string();
+            create_backup_ref(&repo, "uncommit")?;
+            return uncommit_root(&repo, &branch, &id);
+        }
+        let parent = head.parent(0)?;
         // Soft reset: the commit's changes stay staged (like GitHub Desktop).
         repo.reset(parent.as_object(), ResetType::Soft, None)?;
         Ok(())
@@ -1493,17 +1954,44 @@ impl HistoryOps for Git2Engine {
                     "Squash is not possible during a running operation".into(),
                 ));
             }
-            let head_id = repo.head()?.peel_to_commit()?.id();
+            // The squash commits the index: anything staged on top would end up
+            // inside it, and an undo would then throw it away with the commit.
+            let head_id = {
+                let head_commit = repo.head()?.peel_to_commit()?;
+                let staged = repo
+                    .diff_tree_to_index(Some(&head_commit.tree()?), None, None)?
+                    .deltas()
+                    .len();
+                if staged > 0 {
+                    return Err(GitEngineError::InvalidOperation(
+                        "Staged changes would end up in the squashed commit — commit or \
+                         unstage them first"
+                            .into(),
+                    ));
+                }
+                head_commit.id()
+            };
             let oldest = repo.find_commit(Oid::from_str(oldest_id)?)?;
+            if oldest.parent_count() == 0 {
+                // Down to the root commit: the result becomes the new root.
+                if oldest.id() == head_id {
+                    return Err(GitEngineError::InvalidOperation(
+                        "There is nothing to squash".into(),
+                    ));
+                }
+                if !repo.graph_descendant_of(head_id, oldest.id())? {
+                    return Err(GitEngineError::InvalidOperation(
+                        "The squash base is not an ancestor of the current commit".into(),
+                    ));
+                }
+                let branch = current_branch_name(&repo)?;
+                create_backup_ref(&repo, "squash")?;
+                drop(oldest);
+                drop(repo);
+                return self.squash_into_new_root(path, &branch, head_id, message);
+            }
             // Base = first parent of the oldest commit to be squashed.
-            let base_id = oldest
-                .parent(0)
-                .map_err(|_| {
-                    GitEngineError::InvalidOperation(
-                        "The first commit cannot be part of a squash".into(),
-                    )
-                })?
-                .id();
+            let base_id = oldest.parent(0)?.id();
             if base_id == head_id {
                 return Err(GitEngineError::InvalidOperation(
                     "There is nothing to squash".into(),
@@ -1570,7 +2058,233 @@ impl HistoryOps for Git2Engine {
                 .map_err(|e| crate::checkout_error(e, blocked.borrow().clone()))?;
         }
         repo.set_head_detached(commit.id())?;
+        crate::lfs::restore_content(&repo, None);
         Ok(())
+    }
+
+    fn count_commits(&self, path: &Path, from: &str, to: &str) -> Result<u32> {
+        const CAP: u32 = 100_000;
+        let repo = self.open_repo_at(path)?;
+        let from = repo.revparse_single(from)?.peel_to_commit()?.id();
+        let to = repo.revparse_single(to)?.peel_to_commit()?.id();
+        let mut walk = repo.revwalk()?;
+        walk.push(to)?;
+        walk.hide(from)?;
+        let mut n = 0;
+        for oid in walk {
+            oid?;
+            n += 1;
+            if n == CAP {
+                break;
+            }
+        }
+        Ok(n)
+    }
+
+    fn default_branch(&self, path: &Path) -> Result<Option<String>> {
+        let repo = self.open_repo_at(path)?;
+        // The remote's HEAD: what the server calls its default branch.
+        if let Ok(head) = repo.find_reference("refs/remotes/origin/HEAD") {
+            if let Ok(Some(target)) = head.symbolic_target() {
+                if let Some(short) = target.strip_prefix("refs/remotes/") {
+                    return Ok(Some(short.to_string()));
+                }
+            }
+        }
+        for name in ["main", "master"] {
+            if repo.find_branch(name, BranchType::Local).is_ok() {
+                return Ok(Some(name.to_string()));
+            }
+        }
+        Ok(None)
+    }
+
+    fn reflog(&self, path: &Path, reference: &str, limit: usize) -> Result<Vec<ReflogEntry>> {
+        if reference != "HEAD" && !reference.starts_with("refs/heads/") {
+            return Err(GitEngineError::InvalidOperation(format!(
+                "Not a reflog this view shows: {reference}"
+            )));
+        }
+        // A valid ref name has no `..` segments: libgit2 builds `.git/logs/<name>`
+        // from it.
+        if reference != "HEAD" && !git2::Reference::is_valid_name(reference) {
+            return Err(GitEngineError::InvalidOperation(format!(
+                "Invalid branch name: {reference}"
+            )));
+        }
+        let repo = self.open_repo_at(path)?;
+        let log = repo.reflog(reference)?;
+        let mut out = Vec::new();
+        for (index, entry) in log.iter().enumerate().take(limit) {
+            let message = entry.message().ok().flatten().unwrap_or("").to_string();
+            let action = message
+                .split(':')
+                .next()
+                .unwrap_or("")
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_string();
+            let id = entry.id_new();
+            let summary = repo
+                .find_commit(id)
+                .ok()
+                .and_then(|c| c.summary().ok().flatten().map(str::to_string));
+            out.push(ReflogEntry {
+                index,
+                id: id.to_string(),
+                old_id: entry.id_old().to_string(),
+                action,
+                message,
+                time: entry.committer().when().seconds(),
+                summary,
+            });
+        }
+        Ok(out)
+    }
+
+    fn reset_to(
+        &self,
+        path: &Path,
+        commit: &str,
+        mode: ResetMode,
+        limit_bytes: u64,
+    ) -> Result<Option<String>> {
+        validate_commit_hex(commit)?;
+        let repo = self.open_repo_at(path)?;
+        if repo.state() != RepositoryState::Clean {
+            return Err(GitEngineError::InvalidOperation(
+                "Finish or abort the running operation first".into(),
+            ));
+        }
+        let head = repo.head()?;
+        if !head.is_branch() {
+            return Err(GitEngineError::InvalidOperation(
+                "Resetting needs a branch (HEAD is detached)".into(),
+            ));
+        }
+        let target = repo.find_commit(Oid::from_str(commit)?)?;
+        create_backup_ref(&repo, "reset")?;
+
+        // A hard reset overwrites uncommitted work: copy it into the discard
+        // store first, like any discard, so even that is restorable — and
+        // that includes untracked or ignored files at paths the target holds,
+        // which the reset replaces silently.
+        let snapshot = if mode == ResetMode::Hard {
+            let workdir = discard_workdir(&repo)?;
+            let mut changed = uncommitted_paths(self, path)?;
+            changed.extend(overwritten_untracked(&repo, &workdir, &target.tree()?)?);
+            changed.sort();
+            changed.dedup();
+            if changed.is_empty() {
+                None
+            } else {
+                discarded::ensure_room(
+                    &repo,
+                    discarded::estimate(&repo, &workdir, &changed),
+                    limit_bytes,
+                )?;
+                Some((
+                    discarded::begin(&repo, &workdir, "files", &changed)?,
+                    workdir,
+                ))
+            }
+        } else {
+            None
+        };
+
+        let reset_type = match mode {
+            ResetMode::Soft => ResetType::Soft,
+            ResetMode::Mixed => ResetType::Mixed,
+            ResetMode::Hard => ResetType::Hard,
+        };
+        repo.reset(target.as_object(), reset_type, None)?;
+        if mode == ResetMode::Hard {
+            crate::lfs::restore_content(&repo, None);
+        }
+        match snapshot {
+            Some((name, workdir)) => {
+                discarded::finish(&repo, &workdir, &name)?;
+                Ok(Some(name))
+            }
+            None => Ok(None),
+        }
+    }
+
+    fn log_range(
+        &self,
+        path: &Path,
+        from: &str,
+        to: &str,
+        limit: usize,
+    ) -> Result<Vec<CommitInfo>> {
+        let repo = self.open_repo_at(path)?;
+        let from = repo.revparse_single(from)?.peel_to_commit()?.id();
+        let to = repo.revparse_single(to)?.peel_to_commit()?.id();
+        let mut walk = repo.revwalk()?;
+        walk.set_sorting(git2::Sort::TOPOLOGICAL | git2::Sort::TIME)?;
+        walk.push(to)?;
+        walk.hide(from)?;
+        let mut out = Vec::new();
+        for oid in walk.take(limit) {
+            out.push(crate::commit_to_info(&repo.find_commit(oid?)?));
+        }
+        Ok(out)
+    }
+
+    fn range_diff_stream(
+        &self,
+        path: &Path,
+        from: &str,
+        to: &str,
+        max_files: usize,
+        sink: &mut dyn FnMut(tg_domain::FileDiff) -> bool,
+    ) -> Result<usize> {
+        let repo = self.open_repo_at(path)?;
+        let from_tree = repo.revparse_single(from)?.peel_to_tree()?;
+        let to_tree = repo.revparse_single(to)?.peel_to_tree()?;
+        let mut opts = git2::DiffOptions::new();
+        opts.context_lines(3);
+        let mut diff = repo.diff_tree_to_tree(Some(&from_tree), Some(&to_tree), Some(&mut opts))?;
+        let (added, deleted) = diff
+            .deltas()
+            .fold((0, 0), |(a, d), delta| match delta.status() {
+                git2::Delta::Added => (a + 1, d),
+                git2::Delta::Deleted => (a, d + 1),
+                _ => (a, d),
+            });
+        if crate::rename_affordable(added, deleted) {
+            diff.find_similar(None)?;
+        }
+        let mut sent = 0usize;
+        crate::stream_diff_pub(&repo, &diff, &mut |fd| {
+            if sent == max_files || !sink(fd) {
+                return false;
+            }
+            sent += 1;
+            true
+        })
+    }
+
+    fn merge_base(&self, path: &Path, a: &str, b: &str) -> Result<String> {
+        let repo = self.open_repo_at(path)?;
+        let a = repo.revparse_single(a)?.peel_to_commit()?.id();
+        let b = repo.revparse_single(b)?.peel_to_commit()?.id();
+        Ok(repo.merge_base(a, b)?.to_string())
+    }
+
+    fn unborn_branch(&self, path: &Path) -> Result<Option<String>> {
+        let repo = self.open_repo_at(path)?;
+        let unborn = match repo.head() {
+            Ok(_) => false,
+            Err(e) if is_unborn(&e) => true,
+            Err(e) => return Err(e.into()),
+        };
+        if unborn {
+            current_branch_name(&repo).map(Some)
+        } else {
+            Ok(None)
+        }
     }
 
     fn search_log(&self, path: &Path, query: &str, limit: usize) -> Result<Vec<CommitInfo>> {
@@ -1656,6 +2370,16 @@ impl HistoryOps for Git2Engine {
                 ));
             }
         }
+        // Dropping every commit down to the very first: git cannot rebase onto
+        // nothing and leaves an empty commit behind. Taking back the first
+        // commit is "undo last commit" on it.
+        if base_id.is_empty() && steps.iter().all(|s| s.action == "drop") {
+            return Err(GitEngineError::InvalidOperation(
+                "Every commit down to the very first one would be dropped — keep at least \
+                 one, or take the first commit back with “Undo last commit”."
+                    .into(),
+            ));
+        }
         // The first non-drop action has to be pick/reword (squash/fixup needs a
         // preceding commit to fall into).
         if let Some(first) = steps.iter().find(|s| s.action != "drop") {
@@ -1686,13 +2410,21 @@ impl HistoryOps for Git2Engine {
                     "Rebase is not possible during a running operation".into(),
                 ));
             }
-            let base_oid = Oid::from_str(base_id)?;
-            repo.find_commit(base_oid)?; // has to exist
+            // Empty base = from the root commit on (`--root`).
+            let base_oid = if base_id.is_empty() {
+                None
+            } else {
+                let oid = Oid::from_str(base_id)?;
+                repo.find_commit(oid)?; // has to exist
+                Some(oid)
+            };
 
             // Collect the range base..HEAD (first-parent linear history only).
             let mut walk = repo.revwalk()?;
             walk.push_head()?;
-            walk.hide(base_oid)?;
+            if let Some(base) = base_oid {
+                walk.hide(base)?;
+            }
             let mut range: std::collections::HashSet<Oid> = std::collections::HashSet::new();
             for oid in walk {
                 let oid = oid?;
@@ -1812,7 +2544,8 @@ impl HistoryOps for Git2Engine {
         // The message files move into git's rebase-merge and are disposed of by
         // git there — even when the rebase pauses on a conflict and the user only
         // finishes it much later (or externally).
-        sidecar::rebase_interactive(path, &base_oid.to_string(), &todo_lines, &msg_files)
+        let base_arg = base_oid.map_or_else(|| "--root".to_string(), |o| o.to_string());
+        sidecar::rebase_interactive(path, &base_arg, &todo_lines, &msg_files)
     }
 
     // --- Undo/redo executor ---
@@ -1856,15 +2589,15 @@ impl HistoryOps for Git2Engine {
                 let target = repo.find_commit(Oid::from_str(commit)?)?;
                 let reset_type = match mode {
                     ResetMode::Soft => ResetType::Soft,
+                    ResetMode::Mixed => ResetType::Mixed,
                     ResetMode::Hard => {
                         // A hard reset overwrites index + workdir. Allowed only
                         // when nothing unsaved is lost in the process: either the
-                        // tree is clean (untracked files are fine — reset --hard
-                        // leaves them alone), or index and workdir already match
-                        // the target commit exactly (redo right after a soft undo).
-                        let mut opts = git2::StatusOptions::new();
-                        opts.include_untracked(false).include_ignored(false);
-                        let clean = repo.statuses(Some(&mut opts))?.is_empty();
+                        // tree is clean, or index and workdir already match the
+                        // target commit exactly (redo right after a soft undo).
+                        // Untracked files are left alone by reset --hard — except
+                        // at paths the target holds, which it replaces silently.
+                        let clean = uncommitted_paths(self, path)?.is_empty();
                         if !clean && !worktree_matches_commit(&repo, &target)? {
                             return Err(GitEngineError::InvalidOperation(
                                 "Uncommitted changes in the working directory — \
@@ -1872,11 +2605,24 @@ impl HistoryOps for Git2Engine {
                                     .into(),
                             ));
                         }
+                        refuse_overwritten_untracked(&repo, &target)?;
                         ResetType::Hard
                     }
                 };
                 repo.reset(target.as_object(), reset_type, None)?;
+                if reset_type == ResetType::Hard {
+                    crate::lfs::restore_content(&repo, None);
+                }
                 Ok(())
+            }
+            UndoAction::UncommitRoot { branch, commit } => {
+                let repo = self.open_repo_at(path)?;
+                if repo.state() != RepositoryState::Clean {
+                    return Err(GitEngineError::InvalidOperation(
+                        "Finish or abort the running operation first".into(),
+                    ));
+                }
+                uncommit_root(&repo, branch, commit)
             }
             UndoAction::RecreateBranch { name, commit } => {
                 let repo = self.open_repo_at(path)?;
@@ -1899,6 +2645,16 @@ impl HistoryOps for Git2Engine {
                 validate_commit_hex(commit)?;
                 sidecar::stash_store(path, message, commit)?;
                 Ok(())
+            }
+            // Never forced from the undo stack, so no overwrite snapshot (and
+            // no limit) comes into play here.
+            UndoAction::RestoreDiscarded { reference } => {
+                self.restore_discarded(path, reference, false, u64::MAX)
+            }
+            UndoAction::ReapplyDiscarded { reference } => {
+                let repo = self.open_repo_at(path)?;
+                let workdir = discard_workdir(&repo)?;
+                discarded::reapply(&repo, &workdir, reference, false, u64::MAX)
             }
             UndoAction::DropStashByCommit { commit } => {
                 // Stash indices shift; the commit id is stable. Prefix comparison
@@ -2005,7 +2761,39 @@ impl BisectOps for Git2Engine {
     }
 }
 
+/// From this many paths on, staging reports progress: below it, the call is
+/// over before a progress bar could mean anything. The app uses the same bound
+/// to decide when staging is a visible, cancellable operation.
+pub const STAGE_PROGRESS_MIN: usize = 200;
+
 impl StagingOps for Git2Engine {
+    fn stage_with_progress(
+        &self,
+        path: &Path,
+        files: &[String],
+        cancel: &crate::CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<()> {
+        if files.len() < STAGE_PROGRESS_MIN {
+            return self.stage(path, files);
+        }
+        let total = files.len();
+        // One event per percent is plenty — 25k events would only flood IPC.
+        let mut last_percent = None;
+        self.stage_reporting(path, files, Some(cancel), &mut |done| {
+            let percent = (done * 100 / total) as u8;
+            if last_percent != Some(percent) {
+                last_percent = Some(percent);
+                on(tg_domain::GitProgress {
+                    phase: "staging".to_string(),
+                    percent,
+                    done: Some(done as u64),
+                    total: Some(total as u64),
+                });
+            }
+        })
+    }
+
     fn status_numstat(&self, path: &Path) -> Result<Vec<FileLineStats>> {
         let repo = self.open_repo_at(path)?;
         // Unborn HEAD (fresh repo): diff against the empty tree — everything
@@ -2025,9 +2813,21 @@ impl StagingOps for Git2Engine {
         // Fold renames together so the balance matches the status model (a renamed
         // file = ONE entry under the new path, not a full deletion + a full
         // addition).
-        let mut find = git2::DiffFindOptions::new();
-        find.renames(true);
-        diff.find_similar(Some(&mut find))?;
+        // Same rename budget as the status (crate::RENAME_PAIR_BUDGET): beyond
+        // it, find_similar compares every added with every deleted file.
+        let (mut added, mut deleted) = (0, 0);
+        for delta in diff.deltas() {
+            match delta.status() {
+                git2::Delta::Added | git2::Delta::Untracked => added += 1,
+                git2::Delta::Deleted => deleted += 1,
+                _ => {}
+            }
+        }
+        if crate::rename_affordable(added, deleted) {
+            let mut find = git2::DiffFindOptions::new();
+            find.renames(true);
+            diff.find_similar(Some(&mut find))?;
+        }
         let mut out = Vec::with_capacity(diff.deltas().len());
         for (i, delta) in diff.deltas().enumerate() {
             let Some(p) = delta.new_file().path().or_else(|| delta.old_file().path()) else {
@@ -2095,6 +2895,125 @@ impl StagingOps for Git2Engine {
         let partial = build_partial_hunk(&hunk, line_indices, unstage)?;
         sidecar::apply_patch(path, &format!("{header}{partial}"), true, unstage)?;
         Ok(())
+    }
+}
+
+fn discard_workdir(repo: &git2::Repository) -> Result<std::path::PathBuf> {
+    repo.workdir()
+        .map(Path::to_path_buf)
+        .ok_or_else(|| GitEngineError::NotARepository("no workdir".into()))
+}
+
+impl Git2Engine {
+    /// [`DiscardOps::discard_protected`] for large sets: a file counter while
+    /// the copy is written (phase `backup`, cancellable — nothing is discarded
+    /// yet) and while the state after the discard is recorded (phase
+    /// `discarding`). Below [`STAGE_PROGRESS_MIN`] files no events are sent.
+    pub fn discard_protected_with_progress(
+        &self,
+        path: &Path,
+        files: &[String],
+        limit_bytes: u64,
+        cancel: &crate::CancelToken,
+        on: &mut dyn FnMut(tg_domain::GitProgress),
+    ) -> Result<String> {
+        let repo = self.open_repo_at(path)?;
+        let workdir = discard_workdir(&repo)?;
+        // A discarded rename also brings the OLD path back — it belongs into
+        // the snapshot, otherwise a restore could not remove it again.
+        let renames = crate::rename_pairs(&repo, false)?;
+        let mut wanted: Vec<String> = files.to_vec();
+        wanted.extend(files.iter().filter_map(|f| renames.get(f).cloned()));
+        // A file standing where a restored path needs its folder (`d` instead
+        // of `d/a`) is removed by the checkout — it belongs into the copy too.
+        wanted.extend(discarded::blocking_ancestors(&workdir, &wanted));
+        let paths = discarded::expand_paths(&workdir, &wanted)?;
+        discarded::remove_broken(&repo);
+        discarded::ensure_room(
+            &repo,
+            discarded::estimate(&repo, &workdir, &paths),
+            limit_bytes,
+        )?;
+
+        let total = paths.len();
+        let report = total >= STAGE_PROGRESS_MIN;
+        let mut last = None;
+        let mut progress = |phase: &str, done: usize| {
+            if !report {
+                return;
+            }
+            // One event per percent and phase — not one per file.
+            let percent = (done * 100 / total) as u8;
+            if last != Some((phase.to_string(), percent)) {
+                last = Some((phase.to_string(), percent));
+                on(tg_domain::GitProgress {
+                    phase: phase.to_string(),
+                    percent,
+                    done: Some(done as u64),
+                    total: Some(total as u64),
+                });
+            }
+        };
+        let name =
+            discarded::begin_reporting(&repo, &workdir, "files", &paths, Some(cancel), &mut |d| {
+                progress("backup", d)
+            })?;
+        self.discard(path, files)?;
+        discarded::finish_reporting(&repo, &workdir, &name, &mut |d| progress("discarding", d))?;
+        Ok(name)
+    }
+}
+
+impl DiscardOps for Git2Engine {
+    fn discard_protected(&self, path: &Path, files: &[String], limit_bytes: u64) -> Result<String> {
+        self.discard_protected_with_progress(
+            path,
+            files,
+            limit_bytes,
+            &crate::CancelToken::new(),
+            &mut |_| {},
+        )
+    }
+
+    fn discard_hunk_protected(
+        &self,
+        path: &Path,
+        file: &str,
+        hunk_index: usize,
+        limit_bytes: u64,
+    ) -> Result<String> {
+        let repo = self.open_repo_at(path)?;
+        let workdir = discard_workdir(&repo)?;
+        let paths = vec![file.to_string()];
+        discarded::remove_broken(&repo);
+        // Both sides of a hunk discard are worktree contents git does not hold
+        // yet: before AND after get copied, each about the file's size.
+        let needed = discarded::worktree_bytes(&workdir, &paths).saturating_mul(2);
+        discarded::ensure_room(&repo, needed, limit_bytes)?;
+        let name = discarded::begin(&repo, &workdir, "hunk", &paths)?;
+        self.discard_hunk(path, file, hunk_index)?;
+        discarded::finish(&repo, &workdir, &name)?;
+        Ok(name)
+    }
+
+    fn discarded(&self, path: &Path) -> Result<Vec<DiscardedInfo>> {
+        discarded::list(&self.open_repo_at(path)?)
+    }
+
+    fn restore_discarded(
+        &self,
+        path: &Path,
+        name: &str,
+        force: bool,
+        limit_bytes: u64,
+    ) -> Result<()> {
+        let repo = self.open_repo_at(path)?;
+        let workdir = discard_workdir(&repo)?;
+        discarded::restore(&repo, &workdir, name, force, limit_bytes)
+    }
+
+    fn delete_discarded(&self, path: &Path, name: &str) -> Result<()> {
+        discarded::delete(&self.open_repo_at(path)?, name)
     }
 }
 
@@ -2211,10 +3130,9 @@ impl BackupOps for Git2Engine {
         // The restore hard-resets the branch. create_backup_ref only backs up the
         // committed HEAD — uncommitted changes in the working directory would be
         // lost and would be in NO backup. Hence (as with the hard-reset undo, see
-        // apply_undo_action) reject a dirty worktree.
-        let mut opts = git2::StatusOptions::new();
-        opts.include_untracked(false).include_ignored(false);
-        if !repo.statuses(Some(&mut opts))?.is_empty() {
+        // apply_undo_action) reject a dirty worktree — and untracked files the
+        // reset would replace.
+        if !uncommitted_paths(self, path)?.is_empty() {
             return Err(GitEngineError::InvalidOperation(
                 "Uncommitted changes in the working directory — \
                  stash or discard them first"
@@ -2222,9 +3140,11 @@ impl BackupOps for Git2Engine {
             ));
         }
         let commit = reference.peel_to_commit()?;
+        refuse_overwritten_untracked(&repo, &commit)?;
         // Back up the current state — the restore itself stays undoable.
         create_backup_ref(&repo, "restore")?;
         repo.reset(commit.as_object(), ResetType::Hard, None)?;
+        crate::lfs::restore_content(&repo, None);
         Ok(commit.id().to_string())
     }
 
@@ -2316,7 +3236,10 @@ impl ViewOps for Git2Engine {
         // (CRLF worktree vs. LF blob, see the known project trap) would otherwise
         // mark every line as "Not Committed Yet". The UI shows the HEAD state
         // anyway.
-        let out = sidecar::run_git_raw(path, &["blame", "--porcelain", "HEAD", "--", file])?;
+        let out = sidecar::run_git_raw(
+            path,
+            &["blame", "--porcelain", "--no-textconv", "HEAD", "--", file],
+        )?;
         Ok(parse_blame_porcelain(&out, MAX_BLAME_LINES))
     }
 
@@ -2711,8 +3634,13 @@ impl ConfigOps for Git2Engine {
 
     fn config_set(&self, path: &Path, key: &str, value: &str, global: bool) -> Result<()> {
         // Defense in depth: command-triggering config keys are never settable
-        // through the generic settings interface (see is_forbidden_config_key).
-        if is_forbidden_config_key(key) {
+        // through the generic settings interface (see is_forbidden_config_key)
+        // — and beyond that only the keys the app actually writes are. A
+        // denylist always lags behind git (submodule.<n>.update = !cmd,
+        // core.worktree, safe.directory slipped through it).
+        if is_forbidden_config_key(key)
+            || !SETTABLE_CONFIG_KEYS.contains(&key.trim().to_ascii_lowercase().as_str())
+        {
             return Err(GitEngineError::InvalidOperation(format!(
                 "Config key is not allowed (can execute commands): {key}"
             )));

@@ -48,9 +48,11 @@ describe("offerConflictWorkshop()", () => {
     expect(offerConflictWorkshop(null, "merge", 2, "repo")).toBe(false);
   });
 
-  it("stays silent without a running operation (the workshop bounces straight back)", () => {
-    expect(offerConflictWorkshop("conflicts", "clean", 2, "repo")).toBe(false);
-    expect(offerConflictWorkshop("conflicts", "bisect", 2, "repo")).toBe(false);
+  it("offers the workshop for conflicts without a running operation too", () => {
+    // A stash applied with conflicts runs no operation — the workshop is still
+    // where they are resolved.
+    expect(offerConflictWorkshop("conflicts", "clean", 2, "repo")).toBe(true);
+    expect(offerConflictWorkshop("conflicts", "clean", 0, "repo")).toBe(false);
   });
 
   it("stays silent without open conflicted files", () => {

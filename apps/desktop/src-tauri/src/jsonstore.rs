@@ -10,12 +10,35 @@
 //! old file intact.
 
 use std::io::Write;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// Unique suffix counter so concurrent writes (even to the same file) never
 /// collide on the same temp name.
 static SEQ: AtomicU64 = AtomicU64::new(0);
+
+/// Overrides the app config directory (recents, provider accounts). Set by
+/// the E2E tests, so they never touch the real profile; unset in normal use.
+pub const CONFIG_DIR_ENV: &str = "TERRA_GIT_CONFIG_DIR";
+
+/// The override of [`CONFIG_DIR_ENV`], if set. Debug builds only (the E2E
+/// suite drives `target/debug`): a release build always uses the real profile,
+/// so a stray variable cannot point the provider accounts somewhere else.
+pub fn config_dir_override() -> Option<PathBuf> {
+    if !cfg!(debug_assertions) {
+        return None;
+    }
+    std::env::var_os(CONFIG_DIR_ENV)
+        .filter(|v| !v.is_empty())
+        .map(PathBuf::from)
+}
+
+/// The directory the JSON stores live in: the override, else Tauri's app
+/// config directory.
+pub fn config_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
+    use tauri::Manager;
+    config_dir_override().or_else(|| app.path().app_config_dir().ok())
+}
 
 /// Writes `bytes` atomically to `path` (temp file in the same directory +
 /// rename). The temp name carries the PID and a process counter.
@@ -46,7 +69,20 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::atomic_write;
+    use super::{atomic_write, config_dir_override, CONFIG_DIR_ENV};
+
+    #[test]
+    fn an_empty_override_counts_as_unset() {
+        // The only test touching this variable — no race with others.
+        std::env::set_var(CONFIG_DIR_ENV, "");
+        assert_eq!(config_dir_override(), None);
+        std::env::set_var(CONFIG_DIR_ENV, "/tmp/terra-e2e-config");
+        assert_eq!(
+            config_dir_override(),
+            Some(std::path::PathBuf::from("/tmp/terra-e2e-config"))
+        );
+        std::env::remove_var(CONFIG_DIR_ENV);
+    }
 
     #[test]
     fn atomic_write_replaces_and_leaves_no_temp() {

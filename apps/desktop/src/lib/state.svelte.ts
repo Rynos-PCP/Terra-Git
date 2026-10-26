@@ -2,7 +2,8 @@
 // All engine calls go through the typed API; errors end up as a toast in
 // `ui.error`, success messages in `ui.info`.
 
-import { confirm, open } from "@tauri-apps/plugin-dialog";
+import { open } from "@tauri-apps/plugin-dialog";
+import { confirm } from "./dialogs";
 import {
   api,
   type BlameLine,
@@ -23,12 +24,17 @@ import {
   type RepoStatus,
   type ScannedHost,
   type SshKey,
+  type PullMode,
+  type PullStrategy,
+  type ResetMode,
+  type StashApplyOutcome,
   type StashInfo,
   type TagInfo,
   type UnchangedInfo,
   type UndoEntry,
   type UndoStatus,
   type UnpushedCommit,
+  type LfsState,
 } from "./api";
 import { parseBisectOutput } from "./bisect";
 import { goneDeletableCandidates } from "./branchCleanup";
@@ -41,7 +47,13 @@ import {
   worktreeDirty,
 } from "./branchSwitch";
 import { isConflictCandidate } from "./conflictOffer";
-import { resolveErrorMessage, t, tn } from "./i18n.svelte";
+import { formatBytes, webUrlOfRemote } from "./format";
+import { errorTitleKey, type ErrorActionId } from "./errorRegistry";
+import { filesInTheWayWithCount, lockFileNamed } from "./gitOutput";
+import { LFS_INSTALL_URL } from "./lfs";
+import { type StashConflict, workshopAvailable } from "./conflictWorkshop";
+import { rememberKey } from "./updateFrom";
+import { hasMessage, resolveErrorMessage, t, tn } from "./i18n.svelte";
 import { applyPipelineEvent, initialPipelineSlice, type PipelineSlice } from "./pipelineModel";
 import { resetRepoSlices } from "./repoReset";
 import { parseSshHost } from "./sshHost";
@@ -84,6 +96,10 @@ export function savePrefs() {
       reduceMotion: ui.reduceMotion,
       highContrast: ui.highContrast,
       toastDuration: ui.toastDuration,
+      discardLimitMb: ui.discardLimitMb,
+      pullStrategy: ui.pullStrategy,
+      pullStrategyByRepo: ui.pullStrategyByRepo,
+      updateFromByBranch: ui.updateFromByBranch,
       changesPanelWidth: ui.changesPanelWidth,
       historyPanelWidth: ui.historyPanelWidth,
     }),
@@ -124,7 +140,11 @@ export const ui = $state({
 
   /** Main view: repo workspace, settings, commit workshop, pipeline cockpit or
    *  conflict workshop. */
-  view: "repo" as "repo" | "settings" | "commits" | "pipeline" | "conflicts",
+  view: "repo" as "repo" | "settings" | "commits" | "pipeline" | "conflicts" | "compare",
+  /** What the compare view shows: two commits/refs. */
+  compare: null as CompareTarget | null,
+  /** Git LFS in the open repo — null until read. */
+  lfs: null as LfsState | null,
 
   selectedFile: null as { path: string; staged: boolean } | null,
   /** Line balance per changed file for the changes overview
@@ -147,7 +167,18 @@ export const ui = $state({
   progress: null as GitProgress | null,
   /** Name of the repo currently being cloned (shows the clone overlay), otherwise null. */
   cloning: null as string | null,
+  /** Text of the error toast (the description — translated where known). */
   error: null as string | null,
+  /** What the error toast shows around the text: the repo it happened in, the
+   *  code, a short title (heading "REPO : code — title") and git's own output.
+   * Set together with `error` by setError. */
+  errorMeta: null as ErrorMeta | null,
+  /** The stash whose apply left the open conflicts — the workshop names its
+   *  sides after it and drops it when done. Repo-bound. */
+  stashConflict: null as StashConflict | null,
+  /** File the conflict workshop should open with (the "Resolve" button of a
+   *  conflicted row). */
+  conflictFocus: null as string | null,
   info: null as string | null,
   /** Offer in the error toast: either open the conflict workshop or free up the
    *  blocked branch switch via a stash. Unlike `error`/`info` it is REPO-BOUND
@@ -158,6 +189,15 @@ export const ui = $state({
    *  The target branch travels INSIDE the value, not in a second field: that way
    *  there can be no "stashSwitch without a branch". "stashes" points into the
    *  stash list: the way back when changes had to be left behind. */
+  /** The failed operation can be repeated ("Try again" in the toast). */
+  canRetry: false,
+  /** The failed merge/pull can be repeated joining unrelated histories. */
+  canMergeUnrelated: false,
+  /** The failed commit can be repeated once without a signature. */
+  canCommitUnsigned: false,
+  /** Counts commits made — the commit form clears itself on a change, also
+   *  after a commit repeated from the error toast. */
+  commitCount: 0,
   errorAction: null as
     | null
     | { kind: "conflicts" }
@@ -214,6 +254,15 @@ export const ui = $state({
   pruneOnPull: (prefs.pruneOnPull ?? false) as boolean,
   /** Auto-dismiss time for notice toasts in seconds (0 = never). */
   toastDuration: (prefs.toastDuration ?? 4) as number,
+  /** Storage limit of the copies kept for discarded changes, per repo (MB). */
+  discardLimitMb: (prefs.discardLimitMb ?? 500) as number,
+  /** How a pull combines diverged branches by default; "ff-only" = ask every
+   *  time. A pull.rebase/pull.ff in git itself wins. */
+  pullStrategy: (prefs.pullStrategy ?? "merge") as PullStrategy,
+  /** The choice remembered per repository from the "diverged" dialog. */
+  pullStrategyByRepo: (prefs.pullStrategyByRepo ?? {}) as Record<string, PullStrategy>,
+  /** "Update from…": the source last used per repo and branch. */
+  updateFromByBranch: (prefs.updateFromByBranch ?? {}) as Record<string, string>,
   /** Width of the changes list (splitter, px). */
   changesPanelWidth: (prefs.changesPanelWidth ?? 360) as number,
   /** Width of the history sidebar including the commit graph (splitter, px). */
@@ -237,7 +286,7 @@ export const ui = $state({
     | { kind: "remotes" }
     | { kind: "backups" }
     | { kind: "changeRequests" }
-    | { kind: "createCr" }
+    | { kind: "createCr"; target?: string }
     | { kind: "sparse" }
     | { kind: "blame"; file: string }
     | { kind: "stashPush" }
@@ -250,44 +299,301 @@ export const ui = $state({
     | { kind: "tagAt"; commitId: string }
     | { kind: "cherryPickTo"; commitId: string }
     | { kind: "rebase"; baseId: string; commits: CommitInfo[] }
-    | { kind: "conflictEditor"; file: string }
     | { kind: "deleteRepo"; path: string }
-    | { kind: "sshTofu"; scan: ScannedHost; host: string; port: number | null },
+    | { kind: "sshTofu"; scan: ScannedHost; host: string; port: number | null }
+    | { kind: "localChanges"; then: SyncStep; files?: string[]; omitted?: number }
+    | { kind: "divergent"; from?: PullSource }
+    | { kind: "pushRejected"; message: string }
+    | { kind: "updateFrom"; source?: string }
+    | { kind: "reflog" }
+    | { kind: "resetTo"; commitId: string; subject: string }
+    | { kind: "compareBranches" },
 });
+
+/** The frame of the error toast (see `ui.errorMeta`). */
+export interface ErrorMeta {
+  repo: string;
+  code: string;
+  title: string;
+  detail: string | null;
+}
+
+/**
+ * THE way to raise an error toast: text plus frame (repo, code, title, git
+ * output). The situational action (`ui.errorAction`) is reset — callers that
+ * offer one set it right after.
+ */
+export function setError(code: string, description: string, detail?: string | null) {
+  ui.error = description;
+  ui.errorMeta = {
+    repo: ui.repo?.name ?? "terra-git",
+    code,
+    title: t(errorTitleKey(code, hasMessage)),
+    detail: detail?.trim() ? detail : null,
+  };
+  ui.info = null;
+  ui.errorAction = null;
+  ui.canRetry = false;
+  ui.canMergeUnrelated = false;
+  ui.canCommitUnsigned = false;
+  remedy = {};
+}
+
+/** What the ways out of the error toast act on — set right after the error
+ *  was shown, cleared with it. */
+interface Remedy {
+  /** Repeats the failed operation ("Try again", and after a fix). */
+  retry?: () => Promise<unknown>;
+  /** Repeats a merge/pull joining unrelated histories. */
+  unrelated?: () => Promise<unknown>;
+  /** Repeats a commit without a signature. */
+  unsigned?: () => Promise<unknown>;
+  /** The folder of a repository that could not be opened. */
+  path?: string;
+}
+let remedy: Remedy = {};
+
+function offerRemedy(more: Remedy) {
+  remedy = { ...remedy, ...more };
+  ui.canRetry = !!remedy.retry;
+  ui.canMergeUnrelated = !!remedy.unrelated;
+  ui.canCommitUnsigned = !!remedy.unsigned;
+}
+
+/** Counts repository switches. A flow of several steps notes it when it
+ *  starts and runs no further step once another repository was opened —
+ *  every step reads the path of the repository open at that moment. */
+let repoEpoch = 0;
+
+/**
+ * What a running flow or an error toast left behind belongs to the repository
+ * it started in: the ways out of the toast ("Try again" would commit with the
+ * old message into the new repository), a retry after trusting a host, a push
+ * waiting for conflicts, changes waiting in a stash to come back. All of it is
+ * dropped when another repository opens or this one closes. A stash stays in
+ * its own repository's list, where the leftover check names it.
+ */
+function forgetRepoFollowUps() {
+  repoEpoch++;
+  remedy = {};
+  ui.canRetry = false;
+  ui.canMergeUnrelated = false;
+  ui.canCommitUnsigned = false;
+  pendingSshRetry = null;
+  pushRejection = null;
+  pendingPushRetry = null;
+  pendingCarry = null;
+  workshopOnNextStatus = false;
+}
+
+function offerRetry(run: () => Promise<unknown>) {
+  offerRemedy({ retry: run });
+}
+
+/** After a fix: repeat the operation, or say that it can be tried again. */
+async function retryAfterFix(retry: (() => Promise<unknown>) | undefined, done: string) {
+  if (retry) await retry();
+  else showInfo(done);
+}
+
+/**
+ * Runs a way out of the error toast. The toast closes
+ * first — the action has taken over.
+ */
+export async function runErrorAction(id: ErrorActionId) {
+  const { retry, unrelated, unsigned, path: failedPath } = remedy;
+  const path = failedPath ?? ui.repo?.path;
+  // Read before the toast (and its detail) goes.
+  const lock = lockFileNamed(ui.errorMeta?.detail);
+  clearToast();
+  switch (id) {
+    case "manageBackups":
+      ui.modal = { kind: "backups" };
+      break;
+    case "openRemotes":
+      ui.modal = { kind: "remotes" };
+      break;
+    case "raiseLimit":
+    case "openAccounts":
+    case "openSshKeys":
+    case "openIdentity":
+      ui.view = "settings";
+      break;
+    case "installLfs":
+      void api.openExternal(LFS_INSTALL_URL).catch(() => {});
+      break;
+    case "retry":
+      if (retry) await retry();
+      break;
+    case "branchHere":
+      // Pushing from a detached HEAD: a branch at HEAD, published right away
+      // if the user ticks it in the dialog.
+      if (ui.repo) {
+        const head = (await api.log(ui.repo.path, 0, 1).catch(() => []))[0];
+        if (head) ui.modal = { kind: "branchFrom", commitId: head.id };
+      }
+      break;
+    case "removeLock":
+      if (!path || !(await confirm(t("remedy.removeLockConfirm")))) return;
+      try {
+        const removed = await api.removeIndexLock(path, lock);
+        await retryAfterFix(retry, removed ? t("remedy.lockRemoved") : t("remedy.noLock"));
+      } catch (e) {
+        showError(e);
+      }
+      break;
+    case "trustFolder":
+      if (!path || !(await confirm(t("remedy.trustConfirm", { path })))) return;
+      try {
+        await api.trustDirectory(path);
+        await retryAfterFix(retry, t("remedy.trusted"));
+      } catch (e) {
+        showError(e);
+      }
+      break;
+    case "enableLongPaths":
+      if (!path) return;
+      try {
+        await api.configSet(path, "core.longpaths", "true", false);
+        await retryAfterFix(retry, t("remedy.longPathsOn"));
+      } catch (e) {
+        showError(e);
+      }
+      break;
+    case "publishAgain":
+      await gitPush();
+      break;
+    case "deleteGoneBranch":
+      await deleteGoneBranch();
+      break;
+    case "unsetUpstream":
+      if (!path) return;
+      try {
+        await api.unsetUpstream(path);
+        showInfo(t("remedy.upstreamRemoved"));
+        await Promise.all([refreshStatus(), refreshBranches()]);
+      } catch (e) {
+        showError(e);
+      }
+      break;
+    case "unshallow":
+      if (await remoteOp(t("remedy.unshallow"), (p, onProg) => api.fetchUnshallow(p, onProg))) {
+        if (retry) await retry();
+      }
+      break;
+    case "mergeUnrelated":
+      if (unrelated && (await confirm(t("remedy.unrelatedConfirm")))) await unrelated();
+      break;
+    case "commitUnsigned":
+      if (unsigned) await unsigned();
+      break;
+    case "openSigning":
+      ui.view = "settings";
+      break;
+  }
+}
+
+/**
+ * The third way out of `upstream_gone`: the remote branch is
+ * gone, so the local one can go too — but only if it is merged. Switches to
+ * the default branch first (a checked-out branch cannot be deleted); a branch
+ * that is not merged is kept and the user is told why.
+ */
+async function deleteGoneBranch() {
+  const gone = ui.status?.branch;
+  if (!ui.repo || !gone) return;
+  const target = localDefaultBranch(await api.defaultBranch(ui.repo.path).catch(() => null), gone);
+  if (!target) {
+    showInfo(t("remedy.noOtherBranch", { name: gone }));
+    return;
+  }
+  if (!(await confirm(t("remedy.deleteGoneConfirm", { name: gone, target })))) return;
+  await switchBranch(target);
+  // The switch may have stopped at a dialog (local changes) — then nothing
+  // is deleted; the user decides there first.
+  if (ui.status?.branch !== target) return;
+  if ((await deleteBranch(gone, false)) === "needs-force") {
+    showInfo(t("remedy.goneNotMerged", { name: gone }));
+  }
+}
+
+/** The local branch to stand on instead of `current`: the default branch
+ *  (`origin/main` → `main`), else main or master — if it exists locally. */
+function localDefaultBranch(def: string | null, current: string): string | null {
+  const locals = ui.branches.filter((b) => !b.isRemote).map((b) => b.name);
+  const candidates = [def, def?.slice(def.indexOf("/") + 1), "main", "master"];
+  return candidates.find((c): c is string => !!c && c !== current && locals.includes(c)) ?? null;
+}
 
 export function showError(e: unknown) {
   const err = e as CommandError;
+  const code = err?.code ?? "unknown";
   // Show known error codes in the active language; messages carrying details
   // (paths, branch names) come through unchanged from the backend.
   const message = err?.message ?? String(e);
-  ui.error = resolveErrorMessage(err?.code, message);
-  ui.info = null;
+  setError(code, resolveErrorMessage(code, message), err?.detail);
   // Conflict candidates offer the jump into the workshop (whether it really
   // appears is decided by the structural gate in the toast). The status is
   // refreshed silently so the offer does not hang off a stale opState — the
   // pull error path (remoteOp) does not refresh itself, and the file watcher is
-  // suppressed while ui.busy is set.
-  ui.errorAction = isConflictCandidate(err?.code, message) ? { kind: "conflicts" } : null;
-  if (ui.errorAction && ui.repo) void refreshStatus(true);
+  // suppressed while ui.busy is set. git's raw output counts too: the message
+  // of a failed git call is short and the conflict text sits there.
+  const text = `${message}\n${err?.detail ?? ""}`;
+  ui.errorAction = isConflictCandidate(code, text) ? { kind: "conflicts" } : null;
+  if (ui.errorAction && ui.repo) {
+    // Decided on the NEXT status that is actually applied: the operation's own
+    // refresh (its `finally`) often starts right after this one and makes it a
+    // discarded late answer — checking then would look at the old status
+    // (found by an E2E flow: the workshop did not open after a rebase).
+    workshopOnNextStatus = true;
+    void refreshStatus(true);
+  }
+}
+
+/** Open the workshop if the next applied status shows conflicts. */
+let workshopOnNextStatus = false;
+
+/** Number of files in conflict right now. */
+function conflictedCount(): number {
+  return (ui.status?.unstaged ?? []).filter((e) => e.kind === "conflicted").length;
+}
+
+/**
+ * An operation of the user ended in conflicts: go straight into the conflict
+ * workshop instead of leaving the user with a message. The
+ * workshop is where they are resolved — the toast offer stays as the way back.
+ */
+function openWorkshopOnConflicts() {
+  const n = conflictedCount();
+  if (n > 0 && ui.view !== "conflicts" && workshopAvailable(ui.status?.opState, n)) {
+    openConflicts();
+  }
 }
 
 export function showInfo(msg: string) {
   ui.info = msg;
   ui.error = null;
+  ui.errorMeta = null;
   ui.errorAction = null;
 }
 
 export function clearToast() {
   ui.error = null;
+  ui.errorMeta = null;
   ui.info = null;
   ui.errorAction = null;
+  ui.canRetry = false;
+  ui.canMergeUnrelated = false;
+  ui.canCommitUnsigned = false;
+  remedy = {};
 }
 
 /** Open the conflict workshop — ONE way for all entry points (banner, tools
  *  menu, palette, error toast). The toast disappears in the process: it has
  *  served its purpose once you follow the hint. */
-export function openConflicts() {
+export function openConflicts(file?: string) {
   clearToast();
+  ui.conflictFocus = file ?? null;
   // Deliberately WITHOUT `ui.modal = null`: the first version of this fix did
   // that and thereby discarded the manual work in the conflict editor (the
   // resolutions live only in the component until saved) — a new data-loss path.
@@ -371,8 +677,16 @@ export function markHistoryPrepared(path: string) {
 
 /** Opens a repo and reloads all views. */
 export async function openRepo(path: string) {
+  // Another repository while an operation runs here: its next steps would
+  // read the new one's path. Wait for it, or cancel it first.
+  if (ui.repo && ui.repo.path !== path && (ui.busy || ui.working > 0)) {
+    showInfo(t("state.waitBeforeSwitch"));
+    return;
+  }
+  const previous = ui.repo?.path;
   try {
     ui.repo = await api.openRepository(path);
+    if (previous !== ui.repo.path) forgetRepoFollowUps();
     ui.tab = "changes";
     // Reset everything BEFORE loading the new data — otherwise the panels
     // briefly show the (stale) state of the previous repo on a repo switch.
@@ -400,10 +714,12 @@ export async function openRepo(path: string) {
     api.watchRepository(ui.repo.path).catch(() => {});
   } catch (e) {
     showError(e);
+    offerRemedy({ retry: () => openRepo(path), path });
   }
 }
 
 export function closeRepo() {
+  forgetRepoFollowUps();
   api.unwatchRepository().catch(() => {});
   // Invalidate open requests — after closing, no late answer may write into the
   // (emptied) state. Status/history do not check a repo path (unlike the list
@@ -429,6 +745,10 @@ export async function refreshStatus(silent = false) {
     // Late answer (e.g. a background poll after a stage): discard it.
     if (seq !== statusSeq) return;
     ui.status = status;
+    if (workshopOnNextStatus) {
+      workshopOnNextStatus = false;
+      openWorkshopOnConflicts();
+    }
     // Clean up the selection when the file no longer appears in the status.
     if (ui.selectedFile) {
       const list = ui.selectedFile.staged ? ui.status.staged : ui.status.unstaged;
@@ -444,6 +764,9 @@ export async function refreshStatus(silent = false) {
 }
 
 let numstatSeq = 0;
+/** A balance is being computed / another one was requested meanwhile. */
+let numstatRunning = false;
+let numstatPending = false;
 
 /**
  * Loads the line balance for the changes overview. Deliberately NOT part of
@@ -453,15 +776,28 @@ let numstatSeq = 0;
  */
 export async function refreshNumstat() {
   if (!ui.repo) return;
+  // Never two at once: on large change sets one balance takes seconds, and
+  // every status refresh asks again — the requests used to pile up as parallel
+  // full diffs. Now a request during a run only marks a rerun.
+  if (numstatRunning) {
+    numstatPending = true;
+    return;
+  }
+  numstatRunning = true;
   const seq = ++numstatSeq;
   const path = ui.repo.path;
   try {
     const stats = await api.statusNumstat(path);
     // Late answer or the repo has changed in the meantime: discard it.
-    if (seq !== numstatSeq || ui.repo?.path !== path) return;
-    ui.numstat = stats;
+    if (seq === numstatSeq && ui.repo?.path === path) ui.numstat = stats;
   } catch {
     // The balance is a convenience: the overview works without the numbers too.
+  } finally {
+    numstatRunning = false;
+    if (numstatPending) {
+      numstatPending = false;
+      void refreshNumstat();
+    }
   }
 }
 
@@ -477,6 +813,30 @@ export async function refreshBranches() {
   } catch (e) {
     if (seq === branchesSeq && ui.repo?.path === path) showError(e);
   }
+  // Whatever moved the branches may have changed which LFS files are checked out.
+  void refreshLfs();
+}
+
+let lfsSeq = 0;
+
+/** Reads the Git LFS state for the repo banner. Silent: the
+ *  banner is a hint, its absence no error. */
+export async function refreshLfs() {
+  if (!ui.repo) return;
+  const seq = ++lfsSeq;
+  const path = ui.repo.path;
+  try {
+    const state = await api.lfsState(path);
+    if (seq === lfsSeq && ui.repo?.path === path) ui.lfs = state;
+  } catch {
+    // no banner
+  }
+}
+
+/** Downloads the missing LFS objects (`git lfs pull`). The
+ *  refresh after it reads the LFS state again. */
+export async function lfsPull() {
+  await remoteOp(t("lfs.pull"), (path, onProg) => api.lfsPull(path, onProg));
 }
 
 export async function loadMoreHistory(reset = false) {
@@ -586,23 +946,140 @@ async function mutate(op: () => Promise<void>) {
   }
 }
 
-export const stageFiles = (files: string[]) => mutate(() => api.stage(ui.repo!.path, files));
+/**
+ * From this many files on, staging is a visible, cancellable operation with a
+ * file counter in the toolbar — mirrors `STAGE_PROGRESS_MIN` in the engine. (User report: staging ~25k
+ * files looked frozen.)
+ */
+export const LARGE_STAGE = 200;
+
+export async function stageFiles(files: string[]) {
+  if (files.length < LARGE_STAGE) return mutate(() => api.stage(ui.repo!.path, files));
+  if (!ui.repo || ui.busy || ui.cloning) return;
+  const path = ui.repo.path;
+  ui.busy = t("state.staging");
+  ui.busyCancellable = true;
+  ui.progress = null;
+  try {
+    await api.stage(path, files, (p) => (ui.progress = p));
+    showInfo(tn("state.filesStaged", files.length));
+  } catch (e) {
+    // git writes the index only at the very end: a cancelled run stages
+    // nothing and destroys nothing — a neutral notice, not an error.
+    if ((e as CommandError)?.code === "cancelled") showInfo(t("state.stagingCancelled"));
+    else showError(e);
+  } finally {
+    ui.busy = null;
+    ui.busyCancellable = false;
+    ui.progress = null;
+    if (ui.repo?.path === path) await refreshStatus();
+  }
+}
 
 export const unstageFiles = (files: string[]) => mutate(() => api.unstage(ui.repo!.path, files));
 
-export const discardFiles = (files: string[]) => mutate(() => api.discard(ui.repo!.path, files));
+/**
+ * Discards with a snapshot beforehand — restorable from the
+ * backups view and with Ctrl+Z. Files too large to copy need a second, explicit
+ * consent; only then are they discarded without a copy.
+ */
+export async function discardFiles(files: string[]) {
+  if (files.length < LARGE_STAGE) {
+    return mutate(async () => {
+      try {
+        await api.discard(ui.repo!.path, files, discardLimitBytes());
+      } catch (e) {
+        if (!showDiscardStoreFull(e)) throw e;
+      }
+    });
+  }
+  // Large sets (e.g. "Discard all" on ~25k files): copying them first takes
+  // a while — a file counter in the toolbar, and the copy can be cancelled.
+  if (!ui.repo || ui.busy || ui.cloning) return;
+  const path = ui.repo.path;
+  ui.busy = t("state.discarding");
+  ui.busyCancellable = true;
+  ui.progress = null;
+  try {
+    await api.discard(path, files, discardLimitBytes(), (p) => {
+      ui.progress = p;
+      // Only the copy can be cancelled; once the discard itself runs, the
+      // button would promise something it cannot do.
+      if (p.phase !== "backup") ui.busyCancellable = false;
+    });
+    showInfo(tn("state.filesDiscarded", files.length));
+  } catch (e) {
+    if ((e as CommandError)?.code === "cancelled") showInfo(t("state.discardCancelled"));
+    else if (!showDiscardStoreFull(e)) showError(e);
+  } finally {
+    ui.busy = null;
+    ui.busyCancellable = false;
+    ui.progress = null;
+    // refreshStatus also reads the undo stack (the discard is one step).
+    if (ui.repo?.path === path) await refreshStatus();
+  }
+}
 
-export async function createCommit(message: string, amend: boolean): Promise<boolean> {
+/**
+ * The copy a discard needs does not fit into the storage limit: nothing was
+ * discarded. The toast names the sizes and offers both ways out — manage the
+ * backups or raise the limit. Returns false for any other error.
+ */
+export function showDiscardStoreFull(e: unknown): boolean {
+  const err = e as CommandError;
+  if (err?.code !== "discard_store_full") return false;
+  // The engine sends the three byte counts: "<needed> <used> <limit>".
+  const [needed, used, limit] = (err.message ?? "").split(" ").map(Number);
+  setError(
+    "discard_store_full",
+    [needed, used, limit].every(Number.isFinite)
+      ? t("state.discardStoreFull", {
+          needed: formatBytes(needed),
+          used: formatBytes(used),
+          limit: formatBytes(limit),
+        })
+      : t("state.discardStoreFullPlain"),
+  );
+  // Both ways out (manage backups / raise limit) come from the registry.
+  return true;
+}
+
+/** The storage limit of the discard store in bytes (setting, per repo). */
+export function discardLimitBytes(): number {
+  return ui.discardLimitMb * 1024 * 1024;
+}
+
+export async function createCommit(
+  message: string,
+  amend: boolean,
+  unsigned = false,
+): Promise<boolean> {
   if (!ui.repo) return false;
+  // A merge finished with the Commit button instead of Continue: what waits
+  // for its end (carried changes, a push) has to follow as well.
+  const finishing = !!ui.status && ui.status.opState !== "clean";
   ui.working++;
   try {
-    const id = await api.commit(ui.repo.path, message, amend);
+    const id = unsigned
+      ? await api.commit(ui.repo.path, message, amend, true)
+      : await api.commit(ui.repo.path, message, amend);
     logCommitMessage(ui.repo.path, message);
+    ui.commitCount++;
     showInfo(t("state.commitCreated", { id: id.slice(0, 8) }));
     await Promise.all([refreshStatus(), loadMoreHistory(true), refreshRepoInfo()]);
+    if (finishing) await afterOperation(true);
     return true;
   } catch (e) {
     showError(e);
+    // A hook that stopped it can be fixed and the commit repeated; a failed
+    // signature can be skipped once.
+    offerRemedy({
+      retry: () => createCommit(message, amend, unsigned),
+      unsigned:
+        (e as CommandError)?.code === "signing_failed"
+          ? () => createCommit(message, amend, true)
+          : undefined,
+    });
     return false;
   } finally {
     ui.working--;
@@ -860,9 +1337,10 @@ export async function carryChangesAndSwitch(target: SwitchTarget, andThen?: Swit
  * after the previous one succeeded.
  *
  * Our own stash is found again through its text instead of through index 0: a
- * wrong index would unpack someone else's changes. If applying fails (real
- * conflicts against the target branch), the stash stays fully intact and the
- * toast shows the way to it.
+ * wrong index would unpack someone else's changes. If applying is refused, or
+ * leaves files in conflict against the target branch, the stash stays fully
+ * intact and the toast shows the way to it — the engine drops it only after a
+ * conflict-free apply.
  */
 async function carryViaStash(path: string, target: SwitchTarget): Promise<boolean> {
   const name = switchTargetLabel(target);
@@ -870,6 +1348,7 @@ async function carryViaStash(path: string, target: SwitchTarget): Promise<boolea
   // No placeholder value: the catch below returns, so the only path that
   // reaches the pop has assigned a real index.
   let index: number;
+  let stashId: string;
   ui.working++;
   try {
     await api.stashPush(path, message, []);
@@ -877,6 +1356,7 @@ async function carryViaStash(path: string, target: SwitchTarget): Promise<boolea
     const entry = list.find((s) => s.message.includes(message));
     if (!entry) throw { code: "stash_not_found", message } as CommandError;
     index = entry.index;
+    stashId = entry.id;
   } catch (e) {
     showError(e);
     await Promise.all([refreshStatus(), refreshStashes()]);
@@ -896,9 +1376,13 @@ async function carryViaStash(path: string, target: SwitchTarget): Promise<boolea
   let applied = false;
   ui.working++;
   try {
-    await api.stashPop(path, index);
-    showInfo(t("state.changesCarriedOver", { name }));
-    applied = true;
+    const outcome = await api.stashPop(path, index);
+    if (outcome.conflicted.length > 0) {
+      showStashConflicts(outcome.conflicted.length, { id: stashId, message, pop: true });
+    } else {
+      showInfo(t("state.changesCarriedOver", { name }));
+      applied = true;
+    }
   } catch (e) {
     showError(e);
     ui.errorAction = { kind: "stashes" };
@@ -935,8 +1419,14 @@ async function restoreAutoStash(path: string, branch: string) {
 
   ui.working++;
   try {
-    await api.stashPop(path, entry.index);
-    showInfo(t("state.autoStashRestored", { name: branch }));
+    const outcome = await api.stashPop(path, entry.index);
+    if (outcome.conflicted.length > 0)
+      showStashConflicts(outcome.conflicted.length, {
+        id: entry.id,
+        message: entry.message,
+        pop: true,
+      });
+    else showInfo(t("state.autoStashRestored", { name: branch }));
   } catch (e) {
     showError(e);
     ui.errorAction = { kind: "stashes" };
@@ -988,7 +1478,7 @@ export function openStashes() {
   ui.modal = { kind: "stash" };
 }
 
-export async function createBranch(name: string) {
+export async function createBranch(name: string, publish = false) {
   if (!ui.repo) return;
   try {
     await api.createBranch(ui.repo.path, name, true);
@@ -996,7 +1486,10 @@ export async function createBranch(name: string) {
     await Promise.all([refreshRepoInfo(), refreshStatus(), refreshBranches()]);
   } catch (e) {
     showError(e);
+    return;
   }
+  // "Publish right away (branch only)".
+  if (publish && ui.remotes.length > 0) await publishBranchOnly();
 }
 
 type ProgressOp = (path: string, onProgress: (p: GitProgress) => void) => Promise<string>;
@@ -1034,7 +1527,7 @@ function trackedRemote(): string | undefined {
  *  the branch's upstream remote, otherwise the only remote, otherwise "origin".
  *  A force push MUST hit the same remote as a normal push; remotes[0] would be
  *  the alphabetically first one with several remotes (e.g. "backup"). */
-function pushTargetRemote(): string {
+export function pushTargetRemote(): string {
   return trackedRemote() ?? (ui.remotes.length === 1 ? ui.remotes[0].name : "origin");
 }
 
@@ -1049,8 +1542,12 @@ async function remoteOp(
   /** Runs AFTER the success refresh (e.g. auto cleanup after a pull). Passed
    *  through the force/TOFU retry paths so it applies there too. */
   onSuccess?: () => Promise<void>,
-) {
-  if (!ui.repo || ui.busy || ui.cloning) return;
+  /** Takes over an error with its own way out (a dialog) — returns true when
+   *  it did, then no error toast is shown. */
+  onError?: (err: CommandError) => boolean,
+): Promise<boolean> {
+  if (!ui.repo || ui.busy || ui.cloning) return false;
+  const epoch = repoEpoch;
   ui.busy = label;
   ui.busyCancellable = true; // fetch/pull/push run through the cancellable sidecar
   ui.progress = null;
@@ -1059,26 +1556,29 @@ async function remoteOp(
     const output = await op(ui.repo.path, onProg);
     showInfo(output ? `${label}: ${firstLine(output)}` : t("state.opSuccess", { label }));
     await Promise.all([refreshStatus(), refreshBranches(), loadMoreHistory(true)]);
-    if (onSuccess) await onSuccess();
+    if (onSuccess && epoch === repoEpoch) await onSuccess();
+    return epoch === repoEpoch;
   } catch (e) {
     const err = e as CommandError;
     // Cancelled by the user: no error toast, just a neutral notice.
     if (err?.code === "cancelled") {
       showInfo(t("state.opCancelled", { label }));
-      return;
+      return false;
     }
-    // Push rejected because the remote is ahead: offer a force push directly
-    // (instead of making the user interpret the error message themselves).
+    // Push rejected because the remote is ahead: three ways out instead of a
+    // yes/no about force pushing — pull & merge or rebase and
+    // push again, or force with lease.
     if (forceRetry && err?.code === "non_fast_forward") {
       ui.busy = null;
       ui.progress = null;
-      const yes = await confirm(`${err.message}\n\n${t("state.forcePushQuestion")}`, {
-        title: t("state.pushRejectedTitle"),
-        kind: "warning",
-      });
-      if (yes)
-        await remoteOp(t("state.opForce", { label }), forceRetry, undefined, remoteName, onSuccess);
-      return;
+      pushRejection = {
+        retry: () => remoteOp(label, op, forceRetry, remoteName, onSuccess),
+        force: () =>
+          remoteOp(t("state.opForce", { label }), forceRetry, undefined, remoteName, onSuccess),
+        remote: remoteName,
+      };
+      ui.modal = { kind: "pushRejected", message: err.message };
+      return false;
     }
     // Unknown/changed SSH host key: scan the fingerprint and show the TOFU dialog
     // instead of just the raw error message. After confirmation
@@ -1095,17 +1595,20 @@ async function remoteOp(
         const parsed = target ? parseSshHost(target.url) : null;
         if (!parsed) {
           showError(e);
-          return;
+          return false;
         }
-        await handleHostKey(parsed.host, parsed.port, () =>
-          remoteOp(label, op, forceRetry, remoteName, onSuccess),
-        );
+        await handleHostKey(parsed.host, parsed.port, async () => {
+          await remoteOp(label, op, forceRetry, remoteName, onSuccess, onError);
+        });
       } catch (lookupErr) {
         showError(lookupErr);
       }
-      return;
+      return false;
     }
+    if (onError?.(err)) return false;
     showError(e);
+    offerRetry(() => remoteOp(label, op, forceRetry, remoteName, onSuccess, onError));
+    return false;
   } finally {
     ui.busy = null;
     ui.busyCancellable = false;
@@ -1131,27 +1634,116 @@ function firstLine(s: string): string {
   return line.length > 120 ? line.slice(0, 117) + "…" : line;
 }
 
-export const gitFetch = () => remoteOp(t("toolbar.fetch"), api.fetch, undefined, trackedRemote());
+export async function gitFetch() {
+  await remoteOp(t("toolbar.fetch"), api.fetch, undefined, trackedRemote());
+}
 
 /** Silent background fetch (auto fetch): updates ahead/behind without toasts.
  *  Network errors are deliberately swallowed (the remote may be offline). */
 export async function autoFetchTick() {
   if (!ui.repo || ui.busy || ui.cloning || ui.working > 0 || ui.remotes.length === 0) return;
   try {
-    await api.fetch(ui.repo.path);
+    await api.fetch(ui.repo.path, undefined, { background: true });
     await refreshStatus(true);
   } catch {
     // ignore quietly — the next tick tries again
   }
 }
-export const gitPull = () =>
-  remoteOp(
-    t("toolbar.pull"),
-    (path, onProg) => api.pull(path, ui.pruneOnPull, onProg),
+export async function gitPull() {
+  await runPull();
+}
+
+/** The pull strategy for the open repo: the remembered choice, else the setting.
+ *  A choice remembered for this repository was the user's answer in the
+ *  diverged dialog — it beats git's own pull settings as that answer did. */
+function pullStrategy(): PullMode {
+  const remembered = ui.repo ? ui.pullStrategyByRepo[ui.repo.path] : undefined;
+  if (remembered === "merge" || remembered === "rebase") return `${remembered}-chosen`;
+  return remembered || ui.pullStrategy;
+}
+
+/** The explicit answer of a dialog: beats git's `pull.rebase` / `pull.ff`. */
+function chosen(strategy: "merge" | "rebase"): PullMode {
+  return strategy === "merge" ? "merge-chosen" : "rebase-chosen";
+}
+
+/**
+ * Pull with an explicit strategy. Two refusals get a dialog
+ * instead of a message: diverged branches (merge or rebase?) and local changes
+ * in the way (bring them along?). Conflicts open the workshop.
+ */
+async function runPull(strategy?: PullMode, from?: PullSource): Promise<boolean> {
+  const ok = await remoteOp(
+    from ? t("toolbar.pullFrom", { name: `${from.remote}/${from.branch}` }) : t("toolbar.pull"),
+    (path, onProg) => api.pull(path, ui.pruneOnPull, strategy ?? pullStrategy(), onProg, from),
     undefined,
-    trackedRemote(),
+    from?.remote ?? trackedRemote(),
     ui.pruneOnPull ? cleanupGoneBranches : undefined,
+    (err) => {
+      if (err.code === "divergent") {
+        // The chosen remote rides along: the answer pulls from it again.
+        ui.modal = { kind: "divergent", from };
+        return true;
+      }
+      if (err.code === "local_changes_overwritten") {
+        ui.modal = localChangesModal(err, { kind: "pull", strategy, from });
+        return true;
+      }
+      return false;
+    },
   );
+  // No common commit: offer the explicit merge of both histories.
+  if (!ok && ui.errorMeta?.code === "unrelated_histories") {
+    offerRemedy({ unrelated: () => runPull("merge-unrelated", from) });
+  }
+  return ok;
+}
+
+/** A remote + branch to pull from instead of the upstream. */
+export interface PullSource {
+  remote: string;
+  branch: string;
+}
+
+/** Pull from a chosen remote (the pull dropdown). */
+export async function gitPullFrom(remote: string, branch: string) {
+  await runPull(undefined, { remote, branch });
+}
+
+/** Fetch from one remote, or from all of them (`remote` undefined). */
+export async function gitFetchFrom(remote?: string) {
+  await remoteOp(
+    remote ? t("toolbar.fetchFrom", { name: remote }) : t("toolbar.fetchAll"),
+    (path, onProg) => api.fetch(path, onProg, remote ? { remote } : { all: true }),
+    undefined,
+    remote,
+  );
+}
+
+/**
+ * Publish the current branch WITHOUT its unpushed commits:
+ * the branch appears on the remote at its fork point and gets its upstream;
+ * the commits follow with a normal push.
+ */
+export async function publishBranchOnly(remote = pushTargetRemote()) {
+  await remoteOp(
+    t("toolbar.publishBranchOnly"),
+    (path, onProg) => api.publishBranchOnly(path, remote, onProg),
+    undefined,
+    remote,
+  );
+}
+
+/** The "diverged" dialog's answer — optionally remembered for this repo. */
+export async function chooseDivergent(strategy: "merge" | "rebase", remember: boolean) {
+  const from = ui.modal?.kind === "divergent" ? ui.modal.from : undefined;
+  ui.modal = null;
+  if (remember && ui.repo) {
+    ui.pullStrategyByRepo = { ...ui.pullStrategyByRepo, [ui.repo.path]: strategy };
+    savePrefs();
+  }
+  await runPull(chosen(strategy), from);
+}
 
 /** Auto cleanup after a pull (only when pruneOnPull): deletes safe orphaned
  *  local branches. force=false -> the backend rejects unmerged ones (they stay);
@@ -1192,10 +1784,14 @@ export async function gitPushForce() {
   // Pin the remote down BEFORE the confirmation: the dialog text and the actual
   // push target must be guaranteed to match.
   const remote = pushTargetRemote();
-  const yes = await confirm(t("state.forcePushConfirm", { remote }), {
-    title: t("state.forcePush"),
-    kind: "warning",
-  });
+  // The lease compares against the last fetch — an automatic fetch may have
+  // brought commits nobody looked at. Say how many the push deletes there.
+  const behind = remote === trackedRemote() ? (ui.status?.behind ?? 0) : 0;
+  const question = t("state.forcePushConfirm", { remote });
+  const yes = await confirm(
+    behind > 0 ? `${question}\n\n${t("state.forcePushBehind", { n: behind })}` : question,
+    { title: t("state.forcePush"), kind: "warning" },
+  );
   if (!yes) return;
   await remoteOp(
     t("state.forcePush"),
@@ -1242,16 +1838,104 @@ export async function stashPush(message: string, files: string[] = []) {
   }
 }
 
+/**
+ * Applying a stash left files in conflict. It is NOT an ordinary success: the
+ * engine kept the stash, so the message says where it is, and the error toast
+ * stays until it is read.
+ */
+function showStashConflicts(count: number, stash: StashConflict | null) {
+  // Straight into the workshop in its stash mode; the message stays
+  // as the note that the stash is kept.
+  ui.stashConflict = stash;
+  openConflicts();
+  setError("stash_conflicts", tn("state.stashConflictsKept", count));
+  ui.errorAction = { kind: "stashes" };
+}
+
+/**
+ * All conflicts of a stash apply are resolved: a pop drops its stash now —
+ * found by its id, indices may have shifted.
+ */
+export async function finishConflicts() {
+  // Twice in a row (a double click) would drop a second stash: the indices
+  // shift after the first drop.
+  if (!ui.repo || finishingConflicts) return;
+  const path = ui.repo.path;
+  const stash = ui.stashConflict;
+  finishingConflicts = true;
+  ui.working++;
+  try {
+    if (stash?.pop) {
+      const entry = (await api.stashList(path)).find((s) => s.id === stash.id);
+      if (entry) await api.stashDrop(path, entry.index);
+      showInfo(t("conflictws.doneStashDropped"));
+    } else {
+      showInfo(t("conflictws.done"));
+    }
+    ui.stashConflict = null;
+    ui.view = "repo";
+  } catch (e) {
+    showError(e);
+  } finally {
+    ui.working--;
+    finishingConflicts = false;
+    await Promise.all([refreshStatus(), refreshStashes()]);
+  }
+}
+let finishingConflicts = false;
+
+/**
+ * Give up conflicts that belong to no operation: the conflicted files go back
+ * to HEAD (a copy lands in the backups first), a stash stays in the list.
+ */
+export async function abandonConflicts() {
+  if (!ui.repo) return;
+  const path = ui.repo.path;
+  const files = (ui.status?.unstaged ?? [])
+    .filter((e) => e.kind === "conflicted")
+    .map((e) => e.path);
+  if (files.length === 0) return;
+  ui.working++;
+  try {
+    await api.abandonConflicts(path, files, discardLimitBytes());
+    showInfo(ui.stashConflict ? t("conflictws.abandonedStashKept") : t("conflictws.abandoned"));
+    ui.stashConflict = null;
+    ui.view = "repo";
+  } catch (e) {
+    if (!showDiscardStoreFull(e)) showError(e);
+  } finally {
+    ui.working--;
+    await Promise.all([refreshStatus(), refreshStashes()]);
+  }
+}
+
 async function stashOp(
-  op: (path: string, i: number) => Promise<void>,
+  op: (path: string, i: number) => Promise<StashApplyOutcome | void>,
   index: number,
   label: string,
 ) {
   if (!ui.repo) return;
+  const path = ui.repo.path;
   ui.working++;
   try {
-    await op(ui.repo.path, index);
-    showInfo(label);
+    // The backend works by index, the list shown may be old: a stash made in
+    // a terminal meanwhile shifts every index — the pop would hit another
+    // stash, and *Done* would later drop the wrong one.
+    const shown = ui.stashes.find((s) => s.index === index);
+    const stash = (await api.stashList(path)).find((s) => s.index === index);
+    if (!stash || (shown && stash.id !== shown.id)) {
+      showInfo(t("state.stashListChanged"));
+      await refreshStashes();
+      return;
+    }
+    const outcome = await op(path, index);
+    if (outcome && outcome.conflicted.length > 0)
+      showStashConflicts(outcome.conflicted.length, {
+        id: stash.id,
+        message: stash.message,
+        pop: op === api.stashPop,
+      });
+    else showInfo(label);
     await Promise.all([refreshStatus(), refreshStashes()]);
   } catch (e) {
     showError(e);
@@ -1353,31 +2037,305 @@ export async function deleteBranch(
   }
 }
 
-export async function mergeBranch(name: string) {
-  if (!ui.repo) return;
+export const mergeBranch = (name: string) => runMerge(name);
+export const rebaseOnto = (name: string) => runRebase(name);
+
+/** Local changes in the way: the dialog offers to bring them along. */
+function localChangesInTheWay(e: unknown, then: SyncStep): boolean {
+  if ((e as CommandError)?.code !== "local_changes_overwritten") return false;
+  ui.modal = localChangesModal(e as CommandError, then);
+  return true;
+}
+
+/** The local-changes dialog, with the files git named when it refused
+ *  — only when it named some. */
+function localChangesModal(err: CommandError, then: SyncStep) {
+  const { files, omitted } = filesInTheWayWithCount(err?.detail ?? err?.message);
+  if (!files.length) return { kind: "localChanges" as const, then };
+  return omitted
+    ? { kind: "localChanges" as const, then, files, omitted }
+    : { kind: "localChanges" as const, then, files };
+}
+
+async function runMerge(name: string, allowUnrelated = false): Promise<boolean> {
+  if (!ui.repo) return false;
   ui.working++;
   try {
-    const out = await api.mergeBranch(ui.repo.path, name);
+    const out = allowUnrelated
+      ? await api.mergeBranch(ui.repo.path, name, true)
+      : await api.mergeBranch(ui.repo.path, name);
     showInfo(out ? firstLine(out) : t("state.branchMerged", { name }));
+    return true;
   } catch (e) {
-    showError(e);
+    if (!localChangesInTheWay(e, { kind: "merge", name })) {
+      showError(e);
+      offerRemedy({
+        retry: () => runMerge(name, allowUnrelated),
+        unrelated:
+          (e as CommandError)?.code === "unrelated_histories"
+            ? () => runMerge(name, true)
+            : undefined,
+      });
+    }
+    return false;
   } finally {
     ui.working--;
     await Promise.all([refreshStatus(), loadMoreHistory(true)]);
   }
 }
 
-export async function rebaseOnto(name: string) {
-  if (!ui.repo) return;
+async function runRebase(name: string): Promise<boolean> {
+  if (!ui.repo) return false;
   ui.working++;
   try {
     const out = await api.rebaseOnto(ui.repo.path, name);
     showInfo(out ? firstLine(out) : t("state.rebasedOnto", { name }));
+    return true;
   } catch (e) {
-    showError(e);
+    if (!localChangesInTheWay(e, { kind: "rebase", name })) showError(e);
+    return false;
   } finally {
     ui.working--;
     await Promise.all([refreshStatus(), loadMoreHistory(true), refreshBranches()]);
+  }
+}
+
+/** A sync step that local changes can get in the way of. */
+export type SyncStep =
+  | { kind: "pull"; strategy?: PullMode; from?: PullSource }
+  | { kind: "merge"; name: string }
+  | { kind: "rebase"; name: string };
+
+function runSyncStep(step: SyncStep): Promise<boolean> {
+  switch (step.kind) {
+    case "pull":
+      return runPull(step.strategy, step.from);
+    case "merge":
+      return runMerge(step.name);
+    case "rebase":
+      return runRebase(step.name);
+  }
+}
+
+/** Label of a sync step for the dialogs and the stash message. */
+export function syncStepLabel(step: SyncStep): string {
+  switch (step.kind) {
+    case "pull":
+      return t("toolbar.pull");
+    case "merge":
+      return t("sync.opMerge", { name: step.name });
+    case "rebase":
+      return t("sync.opRebase", { name: step.name });
+  }
+}
+
+/** Two commits/refs to compare, with readable labels. */
+export interface CompareTarget {
+  from: string;
+  to: string;
+  fromLabel: string;
+  toLabel: string;
+  /** The branch on the `to` side when `from` is the current branch — the view
+   *  then offers merge, update and PR/MR with it. */
+  branch?: string;
+}
+
+/** Opens the compare view for `from` ↔ `to`. */
+export function openCompare(target: CompareTarget) {
+  clearToast();
+  ui.modal = null;
+  ui.compare = target;
+  ui.view = "compare";
+}
+
+/**
+ * Moves the current branch to `commit` — soft, mixed or hard;
+ * one undo step; a hard reset copies uncommitted work into the backups first.
+ */
+export async function resetBranchTo(commit: string, mode: ResetMode) {
+  if (!ui.repo) return;
+  ui.modal = null;
+  ui.working++;
+  try {
+    await api.resetTo(ui.repo.path, commit, mode, discardLimitBytes());
+    showInfo(t("reset.done", { id: commit.slice(0, 8) }));
+  } catch (e) {
+    if (!showDiscardStoreFull(e)) showError(e);
+  } finally {
+    ui.working--;
+    await Promise.all([
+      refreshStatus(),
+      refreshBranches(),
+      loadMoreHistory(true),
+      refreshUndoStatus(),
+    ]);
+  }
+}
+
+/** The source last used to update the current branch, if any. */
+export function rememberedUpdateSource(): string | undefined {
+  const branch = ui.status?.branch ?? ui.repo?.currentBranch;
+  if (!ui.repo || !branch) return undefined;
+  return ui.updateFromByBranch[rememberKey(ui.repo.path, branch)];
+}
+
+/**
+ * "Update current branch from…": optionally fetch first (so
+ * the remote state is current), then merge or rebase `source` into the
+ * current branch. Local changes in the way get the bring-along dialog;
+ * conflicts open the workshop. The chosen branch is remembered for this one.
+ */
+export async function updateBranchFrom(
+  chosen: string,
+  source: string,
+  method: "merge" | "rebase",
+  fetchFirst: boolean,
+) {
+  if (!ui.repo) return;
+  const branch = ui.status?.branch ?? ui.repo.currentBranch;
+  if (branch) {
+    ui.updateFromByBranch = {
+      ...ui.updateFromByBranch,
+      [rememberKey(ui.repo.path, branch)]: chosen,
+    };
+    savePrefs();
+  }
+  // Fetch the remote the SOURCE comes from (upstream/main → upstream), not
+  // the one the current branch tracks.
+  const sourceRemote = ui.remotes.find((r) => source.startsWith(`${r.name}/`))?.name;
+  const epoch = repoEpoch;
+  if (fetchFirst) {
+    const fetched = await remoteOp(
+      sourceRemote ? t("toolbar.fetchFrom", { name: sourceRemote }) : t("toolbar.fetch"),
+      (path, onProg) =>
+        api.fetch(path, onProg, sourceRemote ? { remote: sourceRemote } : undefined),
+      undefined,
+      sourceRemote ?? trackedRemote(),
+    );
+    if (!fetched || epoch !== repoEpoch) return;
+  }
+  if (method === "merge") await runMerge(source);
+  else await runRebase(source);
+}
+
+/** Changes put aside for a sync step that stopped on conflicts: they come back
+ *  once the operation is continued or aborted. */
+let pendingCarry: { id: string; message: string } | null = null;
+
+/**
+ * "Bring them along": stash (untracked files included), run the step, put the
+ * changes back. If the step stops on conflicts, the changes wait in the stash
+ * until the operation is finished; if putting them back conflicts, the
+ * workshop opens in its stash mode.
+ */
+export async function carryChangesThrough(step: SyncStep) {
+  ui.modal = null;
+  if (!ui.repo) return;
+  const path = ui.repo.path;
+  const label = syncStepLabel(step);
+  const message = t("sync.carryStash", { op: label });
+  let stash: { id: string; message: string };
+  ui.working++;
+  try {
+    await api.stashPush(path, message, []);
+    const entry = (await api.stashList(path)).find((s) => s.message.includes(message));
+    if (!entry) throw { code: "stash_not_found", message } as CommandError;
+    stash = { id: entry.id, message: entry.message };
+  } catch (e) {
+    showError(e);
+    await refreshStatus();
+    return;
+  } finally {
+    ui.working--;
+  }
+
+  const epoch = repoEpoch;
+  await runSyncStep(step);
+  // Another repository meanwhile: the stash stays in this one's list, where
+  // the leftover check names it — never popped into the wrong repository.
+  if (epoch !== repoEpoch) return;
+  await refreshStatus();
+  if (ui.status && ui.status.opState !== "clean") {
+    // Stopped on conflicts: the changes come back after continue/abort.
+    pendingCarry = stash;
+    return;
+  }
+  await restoreCarried(stash);
+}
+
+/** Puts carried changes back (safe pop: conflicts keep the stash). */
+async function restoreCarried(stash: { id: string; message: string }) {
+  if (!ui.repo) return;
+  const path = ui.repo.path;
+  ui.working++;
+  try {
+    const entry = (await api.stashList(path)).find((s) => s.id === stash.id);
+    if (!entry) return;
+    const outcome = await api.stashPop(path, entry.index);
+    if (outcome.conflicted.length > 0)
+      showStashConflicts(outcome.conflicted.length, { ...stash, pop: true });
+    else if (!ui.error) showInfo(t("sync.carriedBack"));
+  } catch (e) {
+    showError(e);
+    ui.errorAction = { kind: "stashes" };
+  } finally {
+    ui.working--;
+    await Promise.all([refreshStatus(), refreshStashes()]);
+  }
+}
+
+/** A push that waits for the conflicts of the pull meant to make it possible. */
+let pendingPushRetry: (() => Promise<boolean>) | null = null;
+
+/** The push-rejected dialog's ways out. */
+let pushRejection: {
+  retry: () => Promise<boolean>;
+  force: () => Promise<boolean>;
+  /** The remote the rejected push went to. */
+  remote?: string;
+} | null = null;
+
+export async function resolvePushRejected(choice: "merge" | "rebase" | "force") {
+  ui.modal = null;
+  const rejection = pushRejection;
+  pushRejection = null;
+  if (!rejection) return;
+  if (choice === "force") {
+    await rejection.force();
+    return;
+  }
+  // Pull from the remote that refused — a push to "backup" is made possible
+  // by backup's commits, not by those of the upstream.
+  const branch = ui.status?.branch;
+  const from =
+    rejection.remote && rejection.remote !== trackedRemote() && branch
+      ? { remote: rejection.remote, branch }
+      : undefined;
+  const epoch = repoEpoch;
+  const pulled = await runPull(chosen(choice), from);
+  if (epoch !== repoEpoch) return;
+  if (pulled) {
+    await rejection.retry();
+    return;
+  }
+  // The pull stopped on conflicts: push once they are resolved.
+  if (ui.status && ui.status.opState !== "clean") pendingPushRetry = rejection.retry;
+}
+
+/** After a continued/aborted operation: carried changes come back, and a push
+ *  that waited for the conflicts is offered. */
+async function afterOperation(continued: boolean) {
+  if (!ui.status || ui.status.opState !== "clean") return;
+  if (pendingCarry) {
+    const stash = pendingCarry;
+    pendingCarry = null;
+    await restoreCarried(stash);
+  }
+  const retry = pendingPushRetry;
+  pendingPushRetry = null;
+  if (continued && retry) {
+    const yes = await confirm(t("sync.pushNow"), { title: t("sync.pushNowTitle") });
+    if (yes) await retry();
   }
 }
 
@@ -1393,6 +2351,7 @@ export async function abortOperation() {
   } finally {
     await Promise.all([refreshStatus(), loadMoreHistory(true)]);
   }
+  await afterOperation(false);
 }
 
 export async function continueOperation() {
@@ -1405,6 +2364,7 @@ export async function continueOperation() {
   } finally {
     await Promise.all([refreshStatus(), loadMoreHistory(true)]);
   }
+  await afterOperation(true);
 }
 
 export async function resolveConflict(file: string, ours: boolean) {
@@ -1464,14 +2424,34 @@ async function historyOp(label: string, op: (path: string) => Promise<unknown>, 
     showError(e);
   } finally {
     ui.working--;
-    await Promise.all([refreshStatus(), loadMoreHistory(true), refreshBranches()]);
+    // refreshRepoInfo: undoing the very first commit leaves the repo without
+    // a commit — the toolbar and the empty-history state hang off that.
+    await Promise.all([
+      refreshStatus(),
+      loadMoreHistory(true),
+      refreshBranches(),
+      refreshRepoInfo(),
+    ]);
   }
 }
 
 export const cherryPick = (id: string) =>
   historyOp(t("state.commitCherryPicked", { id: id.slice(0, 8) }), (p) => api.cherryPick(p, id));
-export const revertCommit = (id: string) =>
-  historyOp(t("state.commitReverted", { id: id.slice(0, 8) }), (p) => api.revertCommit(p, id));
+/** Revert a commit. The very first commit asks first: reverting it removes
+ *  every file it added. */
+export async function revertCommit(id: string, isRoot = false) {
+  if (
+    isRoot &&
+    !(await confirm(t("history.revertRootConfirm"), {
+      title: t("history.revertCommit"),
+      kind: "warning",
+    }))
+  )
+    return;
+  await historyOp(t("state.commitReverted", { id: id.slice(0, 8) }), (p) =>
+    api.revertCommit(p, id),
+  );
+}
 export const undoLastCommit = () =>
   historyOp(t("state.lastCommitUndone"), (p) => api.undoLastCommit(p));
 export const squashFrom = (oldestId: string, message: string) =>
@@ -1653,6 +2633,8 @@ export async function applyWorkshop() {
     if (ui.status?.opState === "rebase") {
       cancelWorkshop();
       await Promise.all([refreshBranches(), loadMoreHistory(true)]);
+      // The rewrite stopped on a conflict: on into the conflict workshop.
+      if (conflictedCount() > 0) openConflicts();
     }
   } finally {
     ui.busy = null;
@@ -1667,7 +2649,12 @@ export async function uncommitTop() {
     await api.undoLastCommit(ui.repo.path);
     showInfo(t("workshop.uncommitted"));
     cancelWorkshop();
-    await Promise.all([refreshStatus(), refreshBranches(), loadMoreHistory(true)]);
+    await Promise.all([
+      refreshStatus(),
+      refreshBranches(),
+      loadMoreHistory(true),
+      refreshRepoInfo(),
+    ]);
   } catch (e) {
     showError(e);
   } finally {
@@ -1837,7 +2824,7 @@ export function closePipeline() {
   ui.view = "repo";
 }
 
-export async function branchFromCommit(name: string, commitId: string) {
+export async function branchFromCommit(name: string, commitId: string, publish = false) {
   if (!ui.repo) return;
   try {
     await api.createBranchFromCommit(ui.repo.path, name, commitId, true);
@@ -1845,7 +2832,9 @@ export async function branchFromCommit(name: string, commitId: string) {
     await Promise.all([refreshStatus(), refreshBranches(), loadMoreHistory(true)]);
   } catch (e) {
     showError(e);
+    return;
   }
+  if (publish && ui.remotes.length > 0) await publishBranchOnly();
 }
 
 export async function runSearch() {
@@ -1895,10 +2884,11 @@ export async function discardHunk(file: string, hunkIndex: number) {
   if (!ui.repo) return;
   ui.working++;
   try {
-    await api.discardHunk(ui.repo.path, file, hunkIndex);
+    await api.discardHunk(ui.repo.path, file, hunkIndex, discardLimitBytes());
     await reloadSelectedDiff();
+    await refreshUndoStatus();
   } catch (e) {
-    showError(e);
+    if (!showDiscardStoreFull(e)) showError(e);
   } finally {
     ui.working--;
   }
@@ -2140,6 +3130,38 @@ export function cancelSshTofu() {
 
 // ================= Backups (backup refs) =================
 
+/**
+ * Writes the state before a discard back. Files changed since then are named
+ * and only overwritten after a confirmation — and even then the engine
+ * snapshots them first, so the overwrite is itself restorable.
+ */
+export async function restoreDiscarded(name: string): Promise<boolean> {
+  if (!ui.repo) return false;
+  const path = ui.repo.path;
+  ui.working++;
+  try {
+    try {
+      await api.restoreDiscarded(path, name, discardLimitBytes());
+    } catch (e) {
+      if ((e as CommandError)?.code !== "discard_restore_conflict") throw e;
+      const yes = await confirm(
+        t("state.discardRestoreOverwrite", { files: (e as CommandError).message }),
+        { title: t("modals.restoreDiscardedTitle"), kind: "warning" },
+      );
+      if (!yes) return false;
+      await api.restoreDiscarded(path, name, discardLimitBytes(), true);
+    }
+    showInfo(t("state.discardedRestored"));
+    await refreshStatus();
+    return true;
+  } catch (e) {
+    if (!showDiscardStoreFull(e)) showError(e);
+    return false;
+  } finally {
+    ui.working--;
+  }
+}
+
 /** Hard-resets the current branch to a backup (the restore is itself backed up). */
 export async function restoreBackup(refName: string): Promise<boolean> {
   if (!ui.repo) return false;
@@ -2258,6 +3280,20 @@ export async function ignoreFile(pattern: string) {
   }
 }
 
+/** "Track with LFS": `pattern` is the file itself or
+ *  `*.<ext>`; `.gitattributes` and the file end up staged. */
+export async function trackWithLfs(pattern: string, file: string) {
+  if (!ui.repo) return;
+  try {
+    await api.lfsTrack(ui.repo.path, pattern, file);
+    showInfo(t("lfs.tracked", { pattern }));
+    await refreshStatus();
+    await refreshLfs();
+  } catch (e) {
+    showError(e);
+  }
+}
+
 export async function showBlame(file: string) {
   if (!ui.repo) return;
   try {
@@ -2286,14 +3322,7 @@ export async function loadImageDiff(file: string, staged: boolean, seq?: number)
 /** Provider detection: returns the web URL of the first remote (GitHub/GitLab/self-hosted). */
 export function remoteWebUrl(): string | null {
   const url = ui.remotes[0]?.url;
-  if (!url) return null;
-  // ssh: git@host:path.git -> https://host/path
-  const ssh = url.match(/^(?:ssh:\/\/)?git@([^:/]+)[:/](.+?)(?:\.git)?$/);
-  if (ssh) return `https://${ssh[1]}/${ssh[2]}`;
-  // Keep the protocol (http/https) — self-hosted GitLab sometimes runs over http only.
-  const web = url.match(/^(https?):\/\/(.+?)(?:\.git)?$/);
-  if (web) return `${web[1]}://${web[2]}`;
-  return null;
+  return url ? webUrlOfRemote(url) : null;
 }
 
 /** Provider family of the first remote — drives the PR/MR URL scheme and wording.

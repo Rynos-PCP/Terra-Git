@@ -98,15 +98,26 @@ export function workshopOrderChanged(commits: UnpushedCommit[], order?: string[]
 }
 
 /**
- * Application order (oldest first) WITHOUT the root commit, which stays
- * read-only as the base and is pinned to the end of the list in the UI.
+ * Application order (oldest first). The root commit is rewritable like any
+ * other — the rebase then runs with `--root`.
  */
 function rewritableIds(commits: UnpushedCommit[], order?: string[]): string[] {
+  return [...effectiveOrder(commits, order)].reverse();
+}
+
+/**
+ * Every commit dropped, the very first one included: git cannot rebase onto
+ * nothing and would leave an empty commit behind (the engine refuses too).
+ */
+export function dropsDownToRoot(
+  commits: UnpushedCommit[],
+  edits: Record<string, WorkshopEdit>,
+): boolean {
+  if (commits.length === 0) return false;
   const oldest = commits[commits.length - 1];
-  const rootInRange = oldest.parentIds.length === 0;
-  return [...effectiveOrder(commits, order)]
-    .reverse()
-    .filter((id) => !(rootInRange && id === oldest.id));
+  return (
+    oldest.parentIds.length === 0 && commits.every((c) => (edits[c.id] ?? baselineOf(c)).dropped)
+  );
 }
 
 /**
@@ -133,8 +144,8 @@ export function firstKeptIsSquash(
  * Builds rebase steps for the ENTIRE unpushed range (data-loss protection).
  * `commits` is newest-first; `order` is the (possibly reordered) display order
  * and becomes the new application order. Returns `null` when there is nothing to
- * do. base = first parent of the oldest commit; if the oldest one is a root (no
- * parents), it becomes the base (read-only) and falls out of the steps.
+ * do. base = first parent of the oldest commit; if the oldest one is the root
+ * commit (no parents), the base is empty — the engine rebases with `--root`.
  */
 export function buildWorkshopSteps(
   commits: UnpushedCommit[],
@@ -148,8 +159,7 @@ export function buildWorkshopSteps(
   if (!anyChange) return null;
 
   const oldest = commits[commits.length - 1];
-  const rootInRange = oldest.parentIds.length === 0;
-  const baseId = rootInRange ? oldest.id : oldest.parentIds[0];
+  const baseId = oldest.parentIds[0] ?? "";
 
   const byId = new Map(commits.map((c) => [c.id, c]));
   const steps: RebaseStep[] = rewritableIds(commits, order).map((id) => {

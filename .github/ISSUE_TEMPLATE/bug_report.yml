@@ -42,7 +42,7 @@ body:
     attributes:
       label: terra-git version
       description: Shown under Settings → App, in the start-screen footer, or in the installer file name.
-      placeholder: "1.0.0"
+      placeholder: "1.1.0"
     validations:
       required: true
 

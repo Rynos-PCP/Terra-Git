@@ -118,12 +118,17 @@ describe("stashAndSwitch()", () => {
   });
 
   it("does NOT switch when the stash already fails", async () => {
-    mockedApi.stashPush.mockRejectedValueOnce({ code: "sidecar_failed", message: "broken" });
+    mockedApi.stashPush.mockRejectedValueOnce({
+      code: "sidecar_failed",
+      message: "git command failed",
+      detail: "broken",
+    });
 
     await stashAndSwitch({ kind: "branch", name: "feature" });
 
     expect(mockedApi.checkoutBranch).not.toHaveBeenCalled();
-    expect(ui.error).toContain("broken");
+    // git's own output is the detail, the text the translated one.
+    expect(ui.errorMeta?.detail).toBe("broken");
     // The counter must not get stuck (buttons would stay disabled).
     expect(ui.working).toBe(0);
   });

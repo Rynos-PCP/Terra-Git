@@ -9,9 +9,10 @@ Architecture and the deliberate deviations from the original design:
 | Tool | Version | Purpose |
 |---|---|---|
 | Rust (rustup, MSVC toolchain) | stable | core, engine, Tauri app |
-| Node.js + npm | 22 (pinned in `.nvmrc`, same as CI; 20.19 is the lowest Vite 8 / ESLint 10 accept) | frontend build (Vite) |
+| Node.js + npm | 22.12 or newer (pinned in `.nvmrc`, same as CI; Vitest 5 and ESLint 10 need it) | frontend build (Vite), tests |
 | Visual Studio Build Tools / VS with C++ workload | 2022+ | MSVC linker, libgit2 build |
-| Git | ≥ 2.40 | sidecar for fetch/pull/push |
+| Git | ≥ 2.40 | sidecar for fetch/pull/push, merges, hooks, LFS |
+| Git LFS (`git-lfs`) | any current | the LFS round trips in `lfs_tests.rs` (they are skipped without it; CI installs it) |
 | WebView2 runtime | preinstalled (Win 11) | UI rendering |
 
 > The table describes the Windows dev environment. For **Linux/macOS bundles** see
@@ -42,11 +43,24 @@ terra-git/
 **Architecture rules** (binding):
 
 - `tg-domain` and `tg-git-engine` are **Tauri-free** (pure libs, `thiserror`).
-- Local Git operations run **in-process** through git2 (vendored libgit2).
+- Local Git operations run **in-process** through git2 (vendored libgit2) —
+  except where only git behaves like git: merges and rebases, commits in a
+  repository with hooks or signing, staging and status in a repository with
+  filter drivers (Git LFS). Those go through the sidecar.
 - Remote operations (fetch/pull/push) go through the **system git sidecar** so
   that the system's credential helpers/SSH agent apply (self-hosted GitLab!).
+  Every sidecar call starts ssh non-interactively (`BatchMode`): an unknown host
+  ends in the trust dialog instead of a question on an invisible console.
+- Calls the app makes on its own (status, history, the automatic fetch) are
+  wrapped in `repo_commands::on_its_own`: no hooks, no repo-local filter
+  commands. New background calls belong in there.
 - Every Tauri command is `async` and wraps engine calls in `spawn_blocking`.
-- Errors cross the IPC boundary only as `{ code, message }` (stable codes).
+- Errors cross the IPC boundary only as `{ code, message, detail? }` — a stable
+  code, a short message and, for failed git calls, git's cleaned-up output.
+  A **new error code** needs an entry in `errorCodes.ts`, a title and a text in
+  both catalogs and, if it has ways out, a registry entry (`errorRegistry.ts`);
+  `errorCodes.test.ts` and a Rust test in `src-tauri/src/error.rs` fail
+  otherwise.
 - Provider APIs (PR/MR list, CI status) go through `tg-providers`
   (reqwest/rustls, system trust store); PATs live **only** in the OS keychain
   (`tg-auth`), account metadata in `providers.json` in the app config dir.
@@ -58,7 +72,7 @@ terra-git/
   System helpers run first.
 - SSH keys can be generated/managed in the settings (`tg-git-engine::ssh`,
   OpenSSH CLIs); unknown host keys are confirmed through a TOFU dialog on the
-  first fetch/push.
+  first fetch, pull, push or clone.
 
 ## Developing
 
@@ -74,7 +88,7 @@ npm run tauri dev    # app with hot reload (Vite + cargo)
 cargo fmt --all -- --check         # CI gate
 cargo check --workspace --all-targets
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace             # ~340 unit and integration tests
+cargo test --workspace             # ~460 unit and integration tests
 cd apps/desktop
 npm run lint                       # ESLint (CI gate)
 npm run format:check               # Prettier (CI gate; `npm run format` rewrites)
@@ -132,9 +146,32 @@ cargo build -p tg-app --features custom-protocol
 npm run e2e     # node --test e2e/ — briefly opens a real app window
 ```
 
-The smoke test checks app startup, the rendered shell and the Ctrl+K palette.
-It runs against the real user profile and is therefore state-tolerant (welcome
-view and repo view are both fine); add new tests as `e2e/*.test.mjs`.
+The app under test runs with a config directory of its own
+(`TERRA_GIT_CONFIG_DIR`, set by `e2e/helpers.mjs`), so the recent list and
+the provider accounts of your real profile are never touched — not even by a
+test that fails half-way. (WebView storage — UI preferences — is still the
+real one.)
+
+- `smoke.test.mjs` — app startup, the rendered shell and the Ctrl+K palette.
+- `flows.test.mjs` — the destructive flows added in 1.1: rebase conflict → workshop → continue / abort; pull with local
+  changes → stash conflict → workshop → done (the stash goes only then);
+  push rejected → pull & merge → push; undo the very first commit; remote
+  branch deleted → delete the merged local branch from the error message.
+  Fixture repositories are built with the git CLI in the temp folder; the
+  app is driven through `data-testid` hooks, independent of the UI language.
+
+Two environment variables, set only by `e2e/helpers.mjs` and honoured only
+by debug builds (a release build ignores both), make the app
+testable: `TERRA_GIT_CONFIG_DIR` (see above) and
+`TERRA_GIT_E2E_ACCEPT_DIALOGS`, with which the app answers its own
+confirmation questions with OK (`src/lib/dialogs.ts`) and records them in
+`window.__e2eDialogs`. A native dialog is out of WebDriver's reach, and
+Tauri locks its IPC objects (`__TAURI_INTERNALS__.invoke` is read-only), so
+patching them from the page does not work. The test files run one after the
+other (`--test-concurrency=1`): each starts its own `tauri-driver` on port
+4444.
+
+Add new tests as `e2e/*.test.mjs`, using `e2e/helpers.mjs`.
 
 ## UI smoke test without Tauri (headless)
 
@@ -163,9 +200,10 @@ Produces installable packages in the workspace target (repo root
 `target/release/bundle/`). **v1 bundles are unsigned** — signing/notarization
 and auto-update follow as a separate step (see [../ROADMAP.md](../ROADMAP.md)).
 Before a release, regenerate `THIRD-PARTY-NOTICES.txt`: `bundle.resources` in
-`tauri.conf.json` embeds it into every bundle, and it has two halves
+`tauri.conf.json` embeds it into every bundle, and it has three parts
 (cargo-about for the Rust graph, `scripts/gen-npm-notices.mjs` for the npm
-packages in the shipped frontend). Commands:
+packages in the shipped frontend, `scripts/gen-vendored-notices.mjs` for the C
+libraries compiled in from vendored sources). Commands:
 [../CONTRIBUTING.md](../CONTRIBUTING.md), section “Supply chain / licenses”.
 
 **Windows** (standard dev environment):
@@ -187,7 +225,7 @@ sudo apt-get update && sudo apt-get install -y \
   libwebkit2gtk-4.1-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev \
   libgtk-3-dev librsvg2-dev libssl-dev libayatana-appindicator3-dev \
   libdbus-1-dev pkg-config patchelf libfuse2 build-essential curl wget file
-#    (Rust via rustup + Node ≥ 20.19 assumed.)
+#    (Rust via rustup + Node ≥ 22.12 assumed.)
 
 # 2) Build (network access required: the AppImage downloads linuxdeploy at
 #    build time — it is itself an AppImage and needs FUSE 2, hence libfuse2):

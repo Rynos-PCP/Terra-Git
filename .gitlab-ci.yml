@@ -24,7 +24,8 @@ rust:
       - target
   script:
     # libdbus: keyring (tg-auth) links against the secret service on Linux.
-    - apt-get update -qq && apt-get install -y -qq libdbus-1-dev pkg-config
+    # git-lfs: the LFS round trips in lfs_tests.rs.
+    - apt-get update -qq && apt-get install -y -qq libdbus-1-dev pkg-config git-lfs
     - rustup component add rustfmt clippy
     # Format is a hard gate — it applies to ALL crates.
     - cargo fmt --all -- --check

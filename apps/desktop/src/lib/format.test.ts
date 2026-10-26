@@ -6,6 +6,7 @@ import {
   initials,
   shortenPath,
   timeAgo,
+  webUrlOfRemote,
 } from "./format";
 import { setLang } from "./i18n.svelte";
 
@@ -34,6 +35,22 @@ describe("deriveCloneName", () => {
   it("returns an empty string when nothing can be derived", () => {
     expect(deriveCloneName("")).toBe("");
     expect(deriveCloneName("   ")).toBe("");
+  });
+  it("never carries credentials of an https remote into the web URL", () => {
+    expect(webUrlOfRemote("https://user:tok@en@gitlab.local/g/p.git")).toBe(
+      "https://gitlab.local/g/p",
+    );
+    expect(webUrlOfRemote("http://oauth2:abc@host/x")).toBe("http://host/x");
+    expect(webUrlOfRemote("git@github.com:o/r.git")).toBe("https://github.com/o/r");
+    expect(webUrlOfRemote("https://github.com/o/r.git")).toBe("https://github.com/o/r");
+    expect(webUrlOfRemote("/local/path")).toBe(null);
+  });
+  it("keeps only harmless characters — the URL decides the name", () => {
+    expect(deriveCloneName("https://evil.example/x;calc")).toBe("x-calc");
+    expect(deriveCloneName("https://h/o/a b&c$(d).git")).toBe("a-b-c-d");
+    expect(deriveCloneName("https://h/o/..")).toBe("");
+    expect(deriveCloneName("git@github.com:repo.git")).toBe("repo");
+    expect(deriveCloneName("https://h/o/Übung_1.2")).toBe("Übung_1.2");
   });
 });
 

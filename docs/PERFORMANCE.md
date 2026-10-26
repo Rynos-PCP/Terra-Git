@@ -59,6 +59,35 @@ the decision is on the record in [../ARCHITECTURE.md](../ARCHITECTURE.md). To
 re-measure:
 `TG_BENCH_FILES=100000 TG_BENCH_COMMITS=50000 cargo bench -p tg-git-engine`.
 
+## Huge change sets: staging and rename detection (2026-10-13)
+
+User report: staging ~24,800 changed files (+8.4 M / −11.6 M lines) looked
+frozen. Reproduced with a synthetic change set of the same shape (modified,
+deleted and new files; Windows 11, NTFS, release build):
+
+| Step | Before | After |
+|---|---|---|
+| Status, 9,780 changes | 20 s | 0.02 s |
+| Status, 24,780 changes | minutes | 0.3 s |
+| Line balance, 9,780 changes | 40 s | 8.8 s (and never two at once) |
+| Unstage all, 24,780 | up to 33 s | 0.1 s |
+| Stage all, 24,780, first time | minutes, no feedback | ~50 s with a file counter, cancellable |
+
+**Cause:** libgit2's inexact rename detection compares every added with every
+deleted file — git itself gives up beyond `diff.renameLimit²`. It ran in the
+status, before every stage/unstage/discard (`rename_pairs`) and in the line
+balance. **Fix:** a budget of 250,000 candidate pairs per status side
+(`RENAME_PAIR_BUDGET`, ≈0.6 s worst case); beyond it additions and deletions
+are shown as such, as git does.
+
+**Staging itself** is bound by writing one new object file per changed file.
+Measured on fresh fixtures, libgit2 stages twice as fast as `git add`
+(16.7 s vs. 33.5 s for 9,780 files; `core.fsync` makes no difference), and
+writing the objects on parallel threads did not help (disk/virus-scanner
+bound). So staging stays on libgit2 and, from 200 files on, reports a file
+counter in the toolbar and can be cancelled — the index is written only at the
+end, so a cancelled run stages nothing.
+
 ## Beyond the benchmark fixture
 
 The fixture above stops at 50k files. For repos of Linux-kernel magnitude

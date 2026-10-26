@@ -4,15 +4,16 @@
   import { api } from "../api";
   import type {
     BackupInfo,
+    DiscardedInfo,
     ChangeRequestList,
     CommandError,
     FileDiff,
     SparseStatus,
     SubmoduleInfo,
   } from "../api";
-  import { deriveCloneName, timeAgo } from "../format";
+  import { deriveCloneName, formatBytes, timeAgo } from "../format";
   import { t, tn } from "../i18n.svelte";
-  import { confirm } from "@tauri-apps/plugin-dialog";
+  import { confirm } from "../dialogs";
   import { parseAutoStashBranch, type SwitchTarget, switchTargetLabel } from "../branchSwitch";
   import type { SwitchFollowUp } from "../state.svelte";
   import {
@@ -33,6 +34,12 @@
     removeRemote,
     renameRemote,
     restoreBackup,
+    carryChangesThrough,
+    chooseDivergent,
+    resolvePushRejected,
+    syncStepLabel,
+    restoreDiscarded,
+    discardLimitBytes,
     setRemoteUrl,
     showError,
     showInfo,
@@ -46,10 +53,13 @@
     updateSubmodules,
   } from "../state.svelte";
   import BlameView from "./BlameView.svelte";
-  import ConflictEditor from "./ConflictEditor.svelte";
   import DiffView from "./DiffView.svelte";
   import Icon from "./Icon.svelte";
   import Modal from "./Modal.svelte";
+  import ReflogModal from "./ReflogModal.svelte";
+  import ResetModal from "./ResetModal.svelte";
+  import CompareBranchesModal from "./CompareBranchesModal.svelte";
+  import UpdateFromModal from "./UpdateFromModal.svelte";
   import RebaseModal from "./RebaseModal.svelte";
   import WorktreesModal from "./WorktreesModal.svelte";
 
@@ -183,9 +193,12 @@
   async function doBranchFrom(commitId: string) {
     if (!newBranchName.trim() || submitting) return;
     submitting = true;
-    await branchFromCommit(newBranchName.trim(), commitId);
+    await branchFromCommit(newBranchName.trim(), commitId, publishBranchFrom);
     close();
   }
+
+  /** "Publish right away (branch only)" in "Branch from here". */
+  let publishBranchFrom = $state(false);
 
   // Remote management
   let remoteName = $state("");
@@ -365,7 +378,7 @@
       newCrTitle = ui.history[0]?.summary ?? "";
       newCrDescription = "";
       newCrDraft = false;
-      newCrTarget = "";
+      newCrTarget = ui.modal.target ?? "";
       api
         .providerDefaultBranch(ui.repo.path)
         .then((b) => (newCrTarget = newCrTarget || b))
@@ -455,6 +468,15 @@
 
   // Backups (backup refs): load the list when opening.
   let backups = $state<BackupInfo[]>([]);
+  let discardedList = $state<DiscardedInfo[]>([]);
+  /** "Remember for this repository" in the diverged dialog. */
+  let rememberStrategy = $state(false);
+  // A fresh question every time: the tick of an earlier answer must not
+  // decide the next one unseen.
+  $effect(() => {
+    if (ui.modal?.kind !== "divergent") rememberStrategy = false;
+  });
+  const discardedUsed = $derived(discardedList.reduce((sum, d) => sum + d.size, 0));
   let backupsLoading = $state(false);
   let backupsLoaded = $state(false);
 
@@ -462,9 +484,12 @@
     if (ui.modal?.kind === "backups" && !backupsLoaded && ui.repo) {
       backupsLoaded = true;
       backupsLoading = true;
-      api
-        .backups(ui.repo.path)
-        .then((list) => (backups = list))
+      const path = ui.repo.path;
+      Promise.all([api.backups(path), api.listDiscarded(path)])
+        .then(([list, discarded]) => {
+          backups = list;
+          discardedList = discarded;
+        })
         .catch((e) => {
           showError(e);
         })
@@ -480,6 +505,7 @@
       rebase: "Rebase",
       "rebase-interactive": t("modals.backupOpRebaseInteractive"),
       restore: t("modals.backupOpRestore"),
+      reset: t("undo.op.reset"),
     };
     return labels[op] ?? op;
   }
@@ -505,6 +531,41 @@
     try {
       await api.deleteBackup(ui.repo.path, b.name);
       backups = backups.filter((x) => x.name !== b.name);
+    } catch (e) {
+      showError(e);
+    }
+  }
+
+  /** Row title of a discard snapshot. */
+  function discardedLabel(d: DiscardedInfo): string {
+    if (d.kind === "hunk") return t("modals.discardedHunk");
+    if (d.kind === "overwrite") return t("modals.discardedOverwrite");
+    return tn("modals.discardedFiles", d.files.length);
+  }
+
+  /** The first paths, the rest as a count — the full list is in the tooltip. */
+  function discardedFiles(d: DiscardedInfo): string {
+    const shown = d.files.slice(0, 3).join(", ");
+    const rest = d.files.length - 3;
+    return rest > 0 ? `${shown} ${t("modals.discardedMore", { n: rest })}` : shown;
+  }
+
+  async function doRestoreDiscarded(d: DiscardedInfo) {
+    if (!ui.repo) return;
+    const ok = await restoreDiscarded(d.name);
+    // A forced restore adds an "overwrite" snapshot — show it right away.
+    if (ok) discardedList = await api.listDiscarded(ui.repo.path).catch(() => discardedList);
+  }
+
+  async function doDeleteDiscarded(d: DiscardedInfo) {
+    const yes = await confirm(t("modals.deleteDiscardedConfirm"), {
+      title: t("modals.deleteDiscardedTitle"),
+      kind: "warning",
+    });
+    if (!yes || !ui.repo) return;
+    try {
+      await api.deleteDiscarded(ui.repo.path, d.name);
+      discardedList = discardedList.filter((x) => x.name !== d.name);
     } catch (e) {
       showError(e);
     }
@@ -1005,6 +1066,7 @@
   </Modal>
 {:else if ui.modal?.kind === "backups"}
   <Modal title={t("modals.backupsTitle")} width="620px" onclose={close}>
+    <h3 class="section-title first">{t("modals.backupsRewritesTitle")}</h3>
     <p class="hint">{t("modals.backupsHint")}</p>
     {#if backupsLoading}
       <p class="hint"><span class="spin"></span> {t("modals.backupsLoading")}</p>
@@ -1034,6 +1096,40 @@
         </div>
       {:else}
         <p class="hint">{t("modals.noBackups")}</p>
+      {/each}
+      <h3 class="section-title">{t("modals.discardedTitle")}</h3>
+      <p class="hint">{t("modals.discardedHint")}</p>
+      <p class="hint usage" class:full={discardedUsed >= discardLimitBytes()}>
+        {t("modals.discardedUsage", {
+          used: formatBytes(discardedUsed),
+          limit: formatBytes(discardLimitBytes()),
+        })}
+      </p>
+      {#each discardedList as d (d.name)}
+        <div class="list-row">
+          <Icon name="undo" size={14} />
+          <strong>{discardedLabel(d)}</strong>
+          <span class="grow muted wrap" title={d.files.join(", ")}>
+            {discardedFiles(d)} · {timeAgo(d.timestamp)}
+          </span>
+          <button
+            class="ghost"
+            disabled={!!ui.busy || ui.working > 0}
+            title={t("modals.restoreDiscardedHover")}
+            onclick={() => doRestoreDiscarded(d)}
+          >
+            {t("modals.restore")}
+          </button>
+          <button
+            class="ghost danger"
+            title={t("modals.deleteDiscardedTitle")}
+            onclick={() => doDeleteDiscarded(d)}
+          >
+            <Icon name="trash" size={13} />
+          </button>
+        </div>
+      {:else}
+        <p class="hint">{t("modals.noDiscarded")}</p>
       {/each}
     {/if}
   </Modal>
@@ -1098,6 +1194,81 @@
       <button onclick={close}>{t("common.cancel")}</button>
     </div>
   </Modal>
+{:else if ui.modal?.kind === "updateFrom"}
+  <UpdateFromModal initial={ui.modal.source} onclose={close} />
+{:else if ui.modal?.kind === "reflog"}
+  <ReflogModal onclose={close} />
+{:else if ui.modal?.kind === "resetTo"}
+  <ResetModal commitId={ui.modal.commitId} subject={ui.modal.subject} onclose={close} />
+{:else if ui.modal?.kind === "compareBranches"}
+  <CompareBranchesModal onclose={close} />
+{:else if ui.modal?.kind === "localChanges"}
+  {@const step = ui.modal.then}
+  <Modal title={t("sync.localChangesTitle")} width="480px" onclose={close}>
+    <p class="hint">{t("sync.localChangesHint", { op: syncStepLabel(step) })}</p>
+    {#if ui.modal.files?.length}
+      {@const more = Math.max(0, ui.modal.files.length - 8) + (ui.modal.omitted ?? 0)}
+      <!-- What git named as in the way. -->
+      <p class="hint">{t("sync.filesInTheWay")}</p>
+      <ul class="in-the-way">
+        {#each ui.modal.files.slice(0, 8) as file (file)}<li title={file}>{file}</li>{/each}
+        {#if more > 0}
+          <li class="more">{t("sync.moreFiles", { n: more })}</li>
+        {/if}
+      </ul>
+    {/if}
+    <button class="opt recommended" onclick={() => carryChangesThrough(step)}>
+      <span class="opt-title">{t("sync.carry")}</span>
+      <span class="opt-hint">{t("sync.carryHint", { op: syncStepLabel(step) })}</span>
+    </button>
+    <button class="opt" onclick={close}>
+      <span class="opt-title">{t("sync.commitFirst")}</span>
+      <span class="opt-hint">{t("sync.commitFirstHint")}</span>
+    </button>
+    <div class="actions">
+      <button onclick={close}>{t("common.cancel")}</button>
+    </div>
+  </Modal>
+{:else if ui.modal?.kind === "divergent"}
+  <Modal title={t("sync.divergentTitle")} width="480px" onclose={close}>
+    <p class="hint">
+      {t("sync.divergentHint", { upstream: ui.status?.upstream ?? t("sync.theRemote") })}
+    </p>
+    <button class="opt recommended" onclick={() => chooseDivergent("merge", rememberStrategy)}>
+      <span class="opt-title">{t("sync.merge")}</span>
+      <span class="opt-hint">{t("sync.mergeHint")}</span>
+    </button>
+    <button class="opt" onclick={() => chooseDivergent("rebase", rememberStrategy)}>
+      <span class="opt-title">{t("sync.rebase")}</span>
+      <span class="opt-hint">{t("sync.rebaseHint")}</span>
+    </button>
+    <label class="check">
+      <input type="checkbox" bind:checked={rememberStrategy} />
+      {t("sync.remember")}
+    </label>
+    <div class="actions">
+      <button onclick={close}>{t("common.cancel")}</button>
+    </div>
+  </Modal>
+{:else if ui.modal?.kind === "pushRejected"}
+  <Modal title={t("sync.pushRejectedTitle")} width="500px" onclose={close}>
+    <p class="hint">{t("sync.pushRejectedHint")}</p>
+    <button class="opt recommended" onclick={() => resolvePushRejected("merge")}>
+      <span class="opt-title">{t("sync.pullMergePush")}</span>
+      <span class="opt-hint">{t("sync.pullMergePushHint")}</span>
+    </button>
+    <button class="opt" onclick={() => resolvePushRejected("rebase")}>
+      <span class="opt-title">{t("sync.pullRebasePush")}</span>
+      <span class="opt-hint">{t("sync.pullRebasePushHint")}</span>
+    </button>
+    <button class="opt danger" onclick={() => resolvePushRejected("force")}>
+      <span class="opt-title">{t("sync.forcePush")}</span>
+      <span class="opt-hint">{t("sync.forcePushHint")}</span>
+    </button>
+    <div class="actions">
+      <button onclick={close}>{t("common.cancel")}</button>
+    </div>
+  </Modal>
 {:else if ui.modal?.kind === "squash"}
   <Modal title={t("modals.squashTitle", { n: ui.modal.count })} onclose={close}>
     <p class="hint">{t("modals.squashHint", { n: ui.modal.count })}</p>
@@ -1125,6 +1296,12 @@
       onkeydown={(e) =>
         e.key === "Enter" && doBranchFrom((ui.modal as { commitId: string }).commitId)}
     />
+    {#if ui.remotes.length > 0}
+      <label class="check">
+        <input type="checkbox" bind:checked={publishBranchFrom} />
+        {t("branch.publishRightAway")}
+      </label>
+    {/if}
     <div class="actions">
       <button onclick={close}>{t("common.cancel")}</button>
       <button
@@ -1175,8 +1352,6 @@
   </Modal>
 {:else if ui.modal?.kind === "rebase"}
   <RebaseModal baseId={ui.modal.baseId} commits={ui.modal.commits} onclose={close} />
-{:else if ui.modal?.kind === "conflictEditor"}
-  <ConflictEditor file={ui.modal.file} onclose={close} />
 {:else if ui.modal?.kind === "sshTofu"}
   {@const scan = ui.modal.scan}
   <Modal title={t("ssh.tofuTitle")} onclose={cancelSshTofu}>
@@ -1295,6 +1470,28 @@
      that way the hint text in the button stays readable. */
   .opt.recommended {
     border-left: 3px solid var(--accent);
+  }
+
+  /* A destructive way out (force push): the title carries the danger colour. */
+  .opt.danger .opt-title {
+    color: var(--deleted);
+  }
+
+  .section-title {
+    margin: var(--space-4) 0 var(--space-1);
+    font-size: 10px;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    color: var(--text-faint);
+  }
+
+  .usage.full {
+    color: var(--deleted);
+  }
+
+  .section-title.first {
+    margin-top: 0;
   }
 
   .list-row {
@@ -1435,5 +1632,25 @@
     justify-content: flex-start;
     text-align: left;
     color: var(--text-primary);
+  }
+
+  .in-the-way {
+    margin: 0 0 var(--space-3);
+    padding-left: var(--space-4);
+    font-family: var(--mono);
+    font-size: 12px;
+    color: var(--text-primary);
+  }
+
+  .in-the-way li {
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .in-the-way .more {
+    font-family: inherit;
+    color: var(--text-muted);
+    list-style: none;
   }
 </style>

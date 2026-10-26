@@ -4,9 +4,11 @@
 // a subset of it into docs/images/.
 //
 // Scenes via ?scene=… (default: changes):
-//   changes, unchanged, welcome, history, conflicts, conflictError,
+//   changes, unchanged, welcome, history, conflicts, stashConflicts, conflictError,
+//   pushRejected, divergent, localChanges, updateFrom, reflog, resetTo, compare,
+//   compareBranches, lfsMissing, lfsNotInstalled, wordDiff,
 //   checkoutBlocked, palette, settings, remotes, backups, crs, clone, sparse,
-//   switchChoice, stashes, createCr, progress, cloning, pipeline, histprep,
+//   switchChoice, stashes, createCr, progress, staging, discardFull, gitError, cloning, pipeline, histprep,
 //   workshop-empty, workshop, multiselect, filecontext, toolsmenu
 //
 // Language via ?lang=de|en, theme via ?theme=dark|light; the ⋯ menu opens on any
@@ -15,7 +17,14 @@ import { mount } from "svelte";
 import App from "./App.svelte";
 import "./app.css";
 import { setLang, t } from "./lib/i18n.svelte";
-import { openPipeline, openWorkshop, selectFile, showError, ui } from "./lib/state.svelte";
+import {
+  openPipeline,
+  openWorkshop,
+  selectFile,
+  showDiscardStoreFull,
+  showError,
+  ui,
+} from "./lib/state.svelte";
 
 const params = new URLSearchParams(location.search);
 const lang = params.get("lang");
@@ -160,6 +169,96 @@ if (scene === "unchanged") {
   ];
   ui.status!.opState = "merge";
   ui.view = "conflicts";
+} else if (scene === "stashConflicts") {
+  // A stash applied with conflicts: no running operation — the workshop names
+  // the sides after the stash and offers Done / Give up.
+  ui.status!.staged = [];
+  ui.status!.unstaged = [{ path: "src/lib/api.ts", origPath: null, kind: "conflicted" }];
+  ui.status!.opState = "clean";
+  ui.stashConflict = { id: "a".repeat(40), message: "On main: WIP header layout", pop: true };
+  ui.view = "conflicts";
+} else if (scene === "updateFrom") {
+  // A release branch to be updated from main.
+  const branch = (name: string, extra: Partial<(typeof ui.branches)[number]> = {}) => ({
+    name,
+    isHead: false,
+    isRemote: false,
+    upstream: null,
+    shortName: null,
+    targetId: null,
+    upstreamGone: false,
+    ...extra,
+  });
+  ui.branches = [
+    branch("release/1.4", { isHead: true, upstream: "origin/release/1.4" }),
+    branch("main", { upstream: "origin/main" }),
+    branch("feature/palette"),
+    branch("origin/main", { isRemote: true, shortName: "main" }),
+    branch("origin/release/1.4", { isRemote: true, shortName: "release/1.4" }),
+  ];
+  ui.status!.branch = "release/1.4";
+  ui.status!.upstream = "origin/release/1.4";
+  ui.modal = { kind: "updateFrom" };
+} else if (scene === "reflog") {
+  ui.modal = { kind: "reflog" };
+} else if (scene === "resetTo") {
+  ui.modal = { kind: "resetTo", commitId: "c2".repeat(20), subject: "fix(stash): keep the stash" };
+} else if (scene === "compare") {
+  ui.compare = {
+    from: "HEAD",
+    to: "origin/main",
+    fromLabel: "main",
+    toLabel: "origin/main",
+    branch: "origin/main",
+  };
+  ui.view = "compare";
+} else if (scene === "lfsMissing") {
+  ui.lfs = { used: true, installed: true, missing: 12 };
+} else if (scene === "lfsNotInstalled") {
+  ui.lfs = { used: true, installed: false, missing: 0 };
+} else if (scene === "wordDiff") {
+  // Word diff: paired changed lines with their changed words marked.
+  const ln = (
+    kind: "context" | "addition" | "deletion",
+    o: number | null,
+    n: number | null,
+    content: string,
+  ) => ({
+    kind,
+    oldLineno: o,
+    newLineno: n,
+    content,
+  });
+  ui.selectedFile = { path: "src/lib/state.svelte.ts", staged: false };
+  ui.fileDiff = {
+    path: "src/lib/state.svelte.ts",
+    oldPath: null,
+    isBinary: false,
+    truncated: false,
+    hunks: [
+      {
+        header: "@@ -40,6 +40,6 @@ export const LIMITS = {",
+        lines: [
+          ln("context", 40, 40, "export const LIMITS = {"),
+          ln("deletion", 41, null, "  maxFiles: 500,"),
+          ln("deletion", 42, null, '  label: "Large commit",'),
+          ln("addition", null, 41, "  maxFiles: 2000,"),
+          ln("addition", null, 42, '  label: "Very large commit",'),
+          ln("context", 43, 43, "  stream: true,"),
+          ln("context", 44, 44, "};"),
+        ],
+      },
+    ],
+  };
+} else if (scene === "compareBranches") {
+  ui.modal = { kind: "compareBranches" };
+} else if (scene === "pushRejected") {
+  ui.modal = { kind: "pushRejected", message: "Push rejected" };
+} else if (scene === "divergent") {
+  ui.status!.upstream = "origin/main";
+  ui.modal = { kind: "divergent" };
+} else if (scene === "localChanges") {
+  ui.modal = { kind: "localChanges", then: { kind: "pull" } };
 } else if (scene === "conflictError") {
   // The way INTO the workshop: a pull with conflicts. The error toast offers the
   // jump, and the tools menu keeps the fixed slot for it open.
@@ -227,6 +326,30 @@ if (a11y) {
 } else if (scene === "progress") {
   ui.busy = "Push";
   ui.progress = { phase: "receiving", percent: 62 };
+} else if (scene === "gitError") {
+  // A failed git call with long output: the toast stays inside the window,
+  // the output scrolls in its own area.
+  showError({
+    code: "sidecar_failed",
+    message: "git command failed",
+    detail: [
+      "error: Your local changes to the following files would be overwritten by merge:",
+      ...Array.from({ length: 60 }, (_, i) => `    src/module-${i}/index.ts`),
+      "Please commit your changes or stash them before you merge.",
+      "Aborting",
+    ].join("\n"),
+  });
+} else if (scene === "discardFull") {
+  // Discarding blocked: the copy does not fit into the storage limit.
+  showDiscardStoreFull({
+    code: "discard_store_full",
+    message: `${120 * 1024 * 1024} ${450 * 1024 * 1024} ${500 * 1024 * 1024}`,
+  });
+} else if (scene === "staging") {
+  // Staging a huge change set: file counter + cancel in the toolbar.
+  ui.busy = t("state.staging");
+  ui.busyCancellable = true;
+  ui.progress = { phase: "staging", percent: 48, done: 11894, total: 24780 };
 } else if (scene === "cloning") {
   ui.cloning = "terra-git";
   ui.progress = { phase: "receiving", percent: 38 };

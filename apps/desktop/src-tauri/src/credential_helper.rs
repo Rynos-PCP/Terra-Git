@@ -50,6 +50,10 @@ fn load_accounts() -> Vec<ProviderAccount> {
 /// App config directory WITHOUT a running Tauri runtime — the same paths Tauri
 /// uses for `app_config_dir()`.
 fn config_dir() -> Option<PathBuf> {
+    // The E2E override reaches the helper through git's environment.
+    if let Some(dir) = crate::jsonstore::config_dir_override() {
+        return Some(dir);
+    }
     #[cfg(target_os = "windows")]
     {
         std::env::var_os("APPDATA").map(|d| PathBuf::from(d).join(IDENTIFIER))

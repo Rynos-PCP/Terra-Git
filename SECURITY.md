@@ -54,6 +54,19 @@ If you are looking deliberately, these are the places where a finding weighs the
   or to write outside the opened repository is a finding.
 - **Provider clients** — `crates/tg-providers/`. TLS verification may only be
   disabled per host and explicitly.
+- **Foreign repositories** — `crates/tg-git-engine/src/repo_commands.rs`. A
+  `.git` folder someone else supplied (an archive, a share — not a clone) must
+  not run anything it defines when it is merely opened, and transfers refuse
+  the programs its config names. What is deliberately left to git itself is
+  described in [ARCHITECTURE.md](ARCHITECTURE.md) under "Foreign repositories".
+- **Destructive operations** — `crates/tg-git-engine/src/discarded.rs`, the
+  reset and undo paths in `ops.rs`, `remedies.rs`. Anything that loses
+  uncommitted work without a copy, or writes or deletes outside the opened
+  repository (through `..`, a symlinked folder, a crafted snapshot), is a
+  finding.
+- **SSH host keys** — `crates/tg-git-engine/src/ssh.rs`. Nothing may be added
+  to `known_hosts` without the user confirming the fingerprint, and only for
+  the host that was asked about.
 
 ## What is **not** a security issue
 
@@ -68,3 +81,12 @@ If you are looking deliberately, these are the places where a finding weighs the
   [CHANGELOG.md](CHANGELOG.md). New insights on it are of course still welcome.
 - Attacks that already require full access to the user account: anyone who
   can read the keychain does not need terra-git.
+- What a repository's hooks and filters do when **you** commit, merge, check out
+  or push in it — git runs them by design, and so does terra-git (opening the
+  repository and its automatic refreshes run none of them).
+- Two known limits of the SSH key manager: a passphrase for a new key is handed
+  to `ssh-keygen` on its command line (it accepts it no other way), so other
+  local users can see it in the process list for the moment the key is being
+  generated; and the "host key changed" warning checks `~/.ssh/known_hosts`
+  only, not a global known_hosts file or a `UserKnownHostsFile` from your ssh
+  config.

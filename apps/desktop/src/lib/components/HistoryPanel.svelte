@@ -7,6 +7,7 @@
     checkoutCommit,
     cherryPick,
     loadMoreHistory,
+    openCompare,
     revertCommit,
     runSearch,
     savePrefs,
@@ -153,6 +154,22 @@
   // next page (guards against search/a running load/the end).
   function maybeLoadMore() {
     if (!searching && !ui.historyComplete && !ui.historyLoading) loadMoreHistory();
+  }
+
+  /** Ctrl/Cmd+click on a second commit compares it with the selected one;
+   * a plain click selects. */
+  function onRowClick(e: MouseEvent, commit: CommitInfo) {
+    const selected = ui.selectedCommit;
+    if ((e.ctrlKey || e.metaKey) && selected && selected.id !== commit.id) {
+      openCompare({
+        from: selected.id,
+        to: commit.id,
+        fromLabel: selected.shortId,
+        toLabel: commit.shortId,
+      });
+      return;
+    }
+    selectCommit(commit);
   }
 </script>
 
@@ -305,7 +322,7 @@
             </svg>
           {/if}
 
-          <button class="body ghost" onclick={() => selectCommit(commit)}>
+          <button class="body ghost" onclick={(e) => onRowClick(e, commit)}>
             {#if r.showAuthor}
               <span class="avatar" style:background={avatarColor(commit.authorName)}>
                 {initials(commit.authorName)}
@@ -366,7 +383,11 @@
               <Icon name="branch" size={14} />
               {t("history.cherryPickOther")}
             </button>
-            <button class="item ghost" role="menuitem" onclick={() => revertCommit(commit.id)}>
+            <button
+              class="item ghost"
+              role="menuitem"
+              onclick={() => revertCommit(commit.id, commit.parentIds.length === 0)}
+            >
               <Icon name="undo" size={14} />
               {t("history.revertCommit")}
             </button>
@@ -391,6 +412,29 @@
               <Icon name="history" size={14} />
               {t("history.checkoutDetached")}
             </button>
+            <button
+              class="item ghost"
+              role="menuitem"
+              onclick={() =>
+                (ui.modal = { kind: "resetTo", commitId: commit.id, subject: commit.summary })}
+            >
+              <Icon name="undo" size={14} />
+              {t("reset.menu")}
+            </button>
+            <button
+              class="item ghost"
+              role="menuitem"
+              onclick={() =>
+                openCompare({
+                  from: commit.id,
+                  to: "HEAD",
+                  fromLabel: commit.shortId,
+                  toLabel: "HEAD",
+                })}
+            >
+              <Icon name="split" size={14} />
+              {t("compare.withHead")}
+            </button>
             {#if ui.status?.opState !== "bisect"}
               <div class="sep-h" role="separator"></div>
               <button class="item ghost" role="menuitem" onclick={() => startBisect(commit.id)}>
@@ -398,7 +442,7 @@
                 {t("bisect.startHere")}
               </button>
             {/if}
-            {#if !searching && idx > 0 && isLinearHeadRange(idx) && commit.parentIds.length > 0}
+            {#if !searching && idx > 0 && isLinearHeadRange(idx)}
               <div class="sep-h" role="separator"></div>
               <button
                 class="item ghost"
@@ -414,7 +458,8 @@
                 onclick={() =>
                   (ui.modal = {
                     kind: "rebase",
-                    baseId: commit.parentIds[0],
+                    // Empty base at the root commit: the engine rebases with --root.
+                    baseId: commit.parentIds[0] ?? "",
                     commits: shownCommits.slice(0, idx + 1),
                   })}
               >

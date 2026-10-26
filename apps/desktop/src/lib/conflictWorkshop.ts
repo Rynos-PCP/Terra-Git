@@ -35,16 +35,48 @@ export const OP_LABELS: Record<string, string> = {
 };
 
 /**
- * Does the workshop have anything to show right now? Only during a multi-step
- * operation with two sides: without one the view throws you straight back to the
- * workspace. Bisect is multi-step too, but it has no conflict sides.
+ * Does the workshop have anything to show right now? During a multi-step
+ * operation with two sides — and whenever files are in conflict at all (a
+ * stash applied with conflicts runs no operation). Bisect is multi-step too,
+ * but it has no conflict sides.
  *
  * ONE definition for all entry points — the tools menu, the palette and the
  * toast offer (`offerConflictWorkshop`) all ask the same thing.
  */
+export function workshopAvailable(opState: string | null | undefined, conflicted = 0): boolean {
+  const twoSided = !!opState && opState !== "clean" && opState !== "bisect";
+  return twoSided || conflicted > 0;
+}
 
-export function workshopAvailable(opState: string | null | undefined): boolean {
-  return !!opState && opState !== "clean" && opState !== "bisect";
+/** The stash whose apply left the conflicts (set by the stash flows). */
+export interface StashConflict {
+  /** Commit id of the stash entry — indices shift, the id does not. */
+  id: string;
+  message: string;
+  /** A pop: the stash is dropped once the conflicts are resolved. */
+  pop: boolean;
+}
+
+/** The texts for conflicts WITHOUT a running operation. */
+export function noOperationCopy(stash: StashConflict | null, branch: string | null): WorkshopCopy {
+  if (!stash) {
+    return {
+      subtitle: { key: "conflictws.sub.noOp" },
+      hint: null,
+      ours: { key: "conflictws.ours.plain" },
+      theirs: { key: "conflictws.theirs.plain" },
+      step: null,
+    };
+  }
+  return {
+    subtitle: { key: "conflictws.sub.stash", params: { message: stash.message } },
+    hint: null,
+    ours: branch
+      ? { key: "conflictws.ours.stash", params: { branch } }
+      : { key: "conflictws.ours.plain" },
+    theirs: { key: "conflictws.theirs.stash" },
+    step: null,
+  };
 }
 
 export function workshopCopy(ctx: OpContext | null): WorkshopCopy {

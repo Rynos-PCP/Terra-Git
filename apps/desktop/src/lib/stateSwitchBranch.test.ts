@@ -6,7 +6,7 @@
 // its steps in the right ORDER, and that a failed step does not make the changes
 // disappear.
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import type { RepoInfo, RepoStatus, StashInfo } from "./api";
+import type { RepoInfo, RepoStatus, StashApplyOutcome, StashInfo } from "./api";
 import { AUTOSTASH_MARKER } from "./branchSwitch";
 
 vi.mock("@tauri-apps/plugin-dialog", () => ({ confirm: vi.fn(async () => false) }));
@@ -35,6 +35,11 @@ const repo: RepoInfo = {
   historyPrepared: true,
 };
 
+/** What the engine reports for a conflict-free pop. */
+const popped: StashApplyOutcome = { conflicted: [], dropped: true };
+/** A pop that left files in conflict: the engine keeps the stash. */
+const popConflict: StashApplyOutcome = { conflicted: ["a.txt"], dropped: false };
+
 vi.mock("./api", () => ({
   api: {
     checkoutBranch: vi.fn(async () => {}),
@@ -42,7 +47,7 @@ vi.mock("./api", () => ({
     cherryPick: vi.fn(async () => ""),
     stashPush: vi.fn(async () => "stashed"),
     stashList: vi.fn(async () => [] as StashInfo[]),
-    stashPop: vi.fn(async () => {}),
+    stashPop: vi.fn(async () => popped),
     status: vi.fn(async () => cleanStatus),
     branches: vi.fn(async () => []),
     logAll: vi.fn(async () => []),
@@ -53,7 +58,7 @@ vi.mock("./api", () => ({
 
 import { api } from "./api";
 import type { SwitchTarget } from "./branchSwitch";
-import { t } from "./i18n.svelte";
+import { t, tn } from "./i18n.svelte";
 import {
   carryChangesAndSwitch,
   checkoutCommit,
@@ -96,7 +101,7 @@ beforeEach(() => {
   ui.stashes = [];
   mockedApi.checkoutBranch.mockImplementation(async () => {});
   mockedApi.stashList.mockImplementation(async () => []);
-  mockedApi.stashPop.mockImplementation(async () => {});
+  mockedApi.stashPop.mockImplementation(async () => popped);
   mockedApi.status.mockImplementation(async () => cleanStatus);
 });
 
@@ -171,12 +176,17 @@ describe("stashAndSwitch() — item 2: leave here", () => {
   });
 
   it("does NOT switch when the stash already fails", async () => {
-    mockedApi.stashPush.mockRejectedValueOnce({ code: "sidecar_failed", message: "broken" });
+    mockedApi.stashPush.mockRejectedValueOnce({
+      code: "sidecar_failed",
+      message: "git command failed",
+      detail: "broken",
+    });
 
     await stashAndSwitch(br("feature"));
 
     expect(mockedApi.checkoutBranch).not.toHaveBeenCalled();
-    expect(ui.error).toContain("broken");
+    // git's own output is the detail, the text the translated one.
+    expect(ui.errorMeta?.detail).toBe("broken");
     expect(ui.working).toBe(0);
   });
 });
@@ -212,6 +222,7 @@ describe("carryChangesAndSwitch() — item 3: bring along", () => {
     ]);
     mockedApi.stashPop.mockImplementationOnce(async () => {
       order.push("pop");
+      return popped;
     });
 
     await carryChangesAndSwitch(br("feature"));
@@ -240,6 +251,26 @@ describe("carryChangesAndSwitch() — item 3: bring along", () => {
     expect(ui.working).toBe(0);
   });
 
+  it("keeps the stash and says so when applying leaves conflicts (libgit2 reports success)", async () => {
+    mockedApi.checkoutBranch.mockImplementationOnce(async () => {
+      throw blocked;
+    });
+    mockedApi.stashList.mockImplementation(async () => [
+      { index: 0, message: `On main: ${carryMessage("feature")}`, id: "e".repeat(40) },
+    ]);
+    mockedApi.stashPop.mockResolvedValueOnce(popConflict);
+
+    await carryChangesAndSwitch(br("feature"), { kind: "cherryPick", commitId: "c".repeat(40) });
+
+    // No "brought over" success — the changes are still in the stash.
+    expect(ui.info).toBeNull();
+    expect(ui.error).toBe(tn("state.stashConflictsKept", 1));
+    expect(ui.errorAction).toEqual({ kind: "stashes" });
+    // The follow-up must not run on a worktree full of conflict markers.
+    expect(mockedApi.cherryPick).not.toHaveBeenCalled();
+    expect(ui.working).toBe(0);
+  });
+
   it("reports other checkout errors directly, without stashing anything", async () => {
     mockedApi.checkoutBranch.mockRejectedValueOnce({
       code: "branch_not_found",
@@ -261,6 +292,17 @@ describe("item 4: what was left behind comes back by itself", () => {
 
     expect(mockedApi.stashPop).toHaveBeenCalledWith("/repo", 0);
     expect(ui.info).toBe(t("state.autoStashRestored", { name: "feature" }));
+  });
+
+  it("keeps the marked stash and says so when restoring it leaves conflicts", async () => {
+    mockedApi.stashList.mockImplementation(async () => [autoStash(0, "feature")]);
+    mockedApi.stashPop.mockResolvedValueOnce(popConflict);
+
+    await switchBranch("feature");
+
+    expect(ui.info).toBeNull();
+    expect(ui.error).toBe(tn("state.stashConflictsKept", 1));
+    expect(ui.errorAction).toEqual({ kind: "stashes" });
   });
 
   it("never touches foreign stashes — only the marker counts", async () => {
@@ -296,7 +338,11 @@ describe("item 4: what was left behind comes back by itself", () => {
   });
 
   it("does not report a stash list error as a failed switch", async () => {
-    mockedApi.stashList.mockRejectedValue({ code: "sidecar_failed", message: "broken" });
+    mockedApi.stashList.mockRejectedValue({
+      code: "sidecar_failed",
+      message: "git command failed",
+      detail: "broken",
+    });
 
     await switchBranch("feature");
 

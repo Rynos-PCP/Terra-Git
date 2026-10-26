@@ -150,9 +150,15 @@ The toolbar across the top, left to right:
 - a **stash** icon (*Manage stashes*) and a **Show Pull Requests** /
   **Show Merge Requests** button, labelled after the provider your remote
   points at;
-- **Fetch**, **Pull** and **Push** with ahead/behind counts, the push button
-  carrying a dropdown for push-to-a-specific-remote, **Force push
-  (--force-with-lease)** and **Manage remotes…**;
+- **Fetch**, **Pull** and **Push** with ahead/behind counts. The pull
+  button's dropdown pulls from another remote (**Pull from mirror/main**,
+  greyed out where that remote lacks the branch), fetches **all remotes** or
+  a single one, and holds **Manage remotes…**; the main button keeps pulling
+  from the upstream. The push button's dropdown pushes to a specific remote,
+  offers **Force push (--force-with-lease)** and **Manage remotes…** — and for
+  a branch that is not published yet, **Publish branch with n commits** or
+  **Publish the branch only** (the branch appears on the remote at the point
+  it forked off, its commits follow with a normal push);
 - a **Commit workshop** button (tooltip *Edit unpushed commits*), which
   appears whenever the branch is ahead of its remote *or* has no upstream at
   all;
@@ -243,6 +249,16 @@ while it holds text the section buttons change from **Stage all** /
 **Unstage all** to **Stage matches** / **Unstage matches** — which is how
 you stage a subset of a large change without clicking every row.
 
+Staging a large set — 200 files or more — runs as a visible operation: the
+toolbar counts *Staging — 11,894 of 24,780 files (48%)* and offers
+**Cancel**. A cancelled run stages nothing. Discarding such a set works the
+same way: the toolbar first counts the copy that is written to Backups
+(*Backing up — … of … files*), then the discard itself; cancelling during
+the copy discards nothing and leaves no half copy behind. With very large change sets
+(hundreds of new and deleted files at once) terra-git shows renamed files as a
+deletion plus an addition, as git does, because pairing them up would take
+longer than the status itself.
+
 **Staging and unstaging.** Click a file to preview its diff. Click the
 `+`/`−` icon on a row to stage or unstage it. You can select several files
 at once (Ctrl/Shift-click, Ctrl+A) on either the unstaged or the staged
@@ -252,15 +268,21 @@ on the unstaged side and **Unstage selection** on the staged one, plus
 lines can be staged and unstaged directly from the diff view (see
 [Reading diffs](#reading-diffs)); discarding works per file and per hunk.
 
-Discarding is the one everyday action that is not undoable. It asks first —
-*Permanently discard changes to “path”?*, and the confirmation adds
-*Untracked files will be deleted.* — and once you confirm, that content is
-gone: it never lands on the undo stack, and no backup is written for it.
+Discarding asks first — *Discard changes to “path”?* — and the confirmation
+adds that untracked files will be deleted and that a copy is kept. That copy
+is the point: before every discard, of whole files or of a single hunk,
+terra-git saves what is about to go, including untracked files. `Ctrl+Z`
+brings it straight back, and the copy stays in the Backups dialog under
+*Discarded changes* (see [Discarded changes](#discarded-changes)). Every
+discard copies all of its files — nothing is ever discarded without a copy. If
+the copy no longer fits into the storage limit, the discard does not happen:
+see [Discarded changes](#discarded-changes).
 
-**The file row `⋯` menu** (*File actions*) holds four entries: **Show
-blame**, **Stash file** (greyed out while an operation is running), **Ignore
-file (.gitignore)** and **Ignore all \*.ext**, with the extension filled in
-from the file you clicked.
+**The file row `⋯` menu** (*File actions*) holds **Show blame**, **Stash
+file** (greyed out while an operation is running), **Ignore file
+(.gitignore)** and **Ignore all \*.ext**, with the extension filled in from
+the file you clicked, and **Track with Git LFS** / **Track all \*.ext with
+Git LFS** (see [Git LFS](#git-lfs)).
 
 ![Multi-select context menu: stage selection / discard changes](images/filecontext.png)
 
@@ -322,6 +344,11 @@ are in split. The Changes tab's diff is always unified, because that is the
 view in which you stage individual hunks and lines and a split layout would
 have nowhere to put the controls. The choice is remembered between sessions;
 unified is the default. Common languages get syntax highlighting in both.
+
+**What changed inside a line.** When a removed line is followed by its
+replacement, the words that actually differ are highlighted more strongly
+on both lines — the rest of the line is unchanged. Lines that were rewritten
+almost entirely are left without word marks, since the whole line changed.
 
 **Staging hunks and lines.** In the Changes tab, hunk headers carry a
 `+ Stage` / `− Unstage` button (its tooltip spells it out as *Stage hunk* /
@@ -443,6 +470,10 @@ in the app:
   new branch; there is no create-without-switching option.
 - **Create tag here…** — see [Tags](#tags).
 - **Check out here (detached)** — see below.
+- **Reset current branch to here…** — see [Reset the branch to a
+  commit](#reset-the-branch-to-a-commit).
+- **Compare with HEAD** — see [Comparing commits and
+  branches](#comparing-commits-and-branches).
 - **Bisect: from here (good) to HEAD (bad)** — see [The bisect
   assistant](#the-bisect-assistant).
 - **Squash last n commits…** and **Interactive rebase from here…** — see
@@ -480,6 +511,33 @@ names it as the **First bad commit**. **Finish** ends the session and
 returns you to the branch you started from; **Abort** does the same at any
 earlier point.
 
+### Comparing commits and branches
+
+The compare view answers "what is the difference between these two?" for
+any pair of commits or branches. There are four ways in:
+
+- **Two commits:** select a commit in the History tab, then `Ctrl`+click
+  (`Cmd`+click on macOS) a second one.
+- **A commit and HEAD:** *Compare with HEAD* in the commit action menu.
+- **A branch and the current branch:** the compare button on a row of the
+  branch menu.
+- **Any two branches:** *Compare branches…* in the command palette, with a
+  picker for each side (the current branch and its upstream are
+  preselected; the arrow button swaps them).
+
+The view has three tabs. **Changes** is the diff from the point where the
+two sides forked to the second side — what a merge of it would bring in —
+in the same diff view as a single commit, capped for very large
+comparisons. **Only in A** and **Only in B** list the commits each side has
+that the other has not. When one side is the current branch, three
+buttons act on the other branch right away: **Merge into current
+branch**, **Update current branch from it…** (the *Update from* dialog with
+that branch preselected) and **Create pull/merge request…** with it as the
+target. **Back to workspace** closes the view; switching repositories
+closes it too.
+
+![Compare view: the changes main would get from origin/main](images/compare.png)
+
 ## Branches & merging
 
 The branch button in the toolbar opens the branch list. A **Filter
@@ -494,11 +552,26 @@ delete.* That badge is the visible half of the **Auto-clean orphaned
 branches on pull** setting; with the setting off, terra-git only marks them
 and leaves the deleting to you.
 
-Per entry you get **Merge into current branch**, and for local branches also
-**Rebase current branch onto this**, **Rename** and **Delete**. Deleting
-checks whether the branch is merged first and asks again before
-force-deleting an unmerged one. Conflicts from a merge or rebase open the
-conflict banner — see [Resolving conflicts](#resolving-conflicts).
+Per entry you get **Merge into current branch** and **Rebase current branch
+onto this** (remote branches included), and for local branches also
+**Rename** and **Delete**. Deleting checks whether the branch is merged first
+and asks again before force-deleting an unmerged one. Conflicts from a merge
+or rebase open the conflict workshop — see
+[Resolving conflicts](#resolving-conflicts).
+
+**Updating a branch from another one.** At the top of the branch menu (and
+in the palette) sits **Update current branch from…** — the way to bring a
+release branch up to date with main, or a hotfix with its release. The
+dialog lists every other branch, local ones first, remote ones as well, each
+with what it would bring: *7 commits to take over*, or greyed out *already
+up to date*. The branch you used last time for the current branch is
+preselected; otherwise the repository's default branch. For a local branch
+with an upstream, **Use the remote state (origin/main) — fetches first** is
+on, so you never merge an outdated copy. Choose **Merge** or **Rebase**; a
+preview line says what will happen (*Merges 7 commits from origin/main into
+release/1.4*). Next to the current branch the menu then shows how far it is
+behind that source (*3 behind main*). Local changes in the way and conflicts
+are handled as for a pull.
 
 **Switching with uncommitted changes.** If you still have uncommitted work
 when you switch, terra-git asks where it belongs instead of deciding for you:
@@ -520,9 +593,10 @@ cherry-pick) is running — git refuses to switch during those anyway.
 
 ## Resolving conflicts
 
-terra-git offers three surfaces for the same job, and knowing which is which
-saves a lot of hunting. All three write the same result, so moving between
-them in the middle of a conflict is perfectly fine.
+Conflicts are resolved in one place: the **conflict workshop**. When a
+merge, pull, cherry-pick, revert, rebase, a rewrite in the commit workshop or
+a stash ends in conflicts, terra-git takes you there by itself. The banner
+and the changes list are the ways back into it.
 
 **The banner** is a status strip across the top of the workspace: it names
 the operation (*Merge in progress*, *Rebase in progress*, …) and how many
@@ -532,31 +606,19 @@ and **Continue** stays disabled until nothing is left. The banner belongs to
 the Changes/History workspace and is not shown inside the workshop.
 
 **The changes list** is the quick route for a single file. A conflicted row
-carries **Resolve** (tooltip *Resolve in conflict editor*), **Mine**,
-**Theirs** and an external-tool icon (*Open in merge tool*). **Mine** and
-**Theirs** take that whole file from one side in one click; the icon hands
-it to the merge tool you configured in Git.
-
-**Resolve** opens the conflict editor for that one file — a dialog titled
-*Resolve conflict — file*. You work segment by segment rather than on the
-file as a whole: each conflicting segment shows both sides side by side
-(plus **Base**, where git recorded a common ancestor), with the buttons
-**Mine**, **Incoming**, **Both (mine first)** and **Both (incoming first)**.
-Segments you have not answered yet say *Still open — choose an option*. The
-part nobody finds by accident: the result of each segment appears as an
-editable text box, so you can type the merged version yourself instead of
-picking a side. A counter tracks *3 of 7 conflicts resolved*, and **Resolve
-& stage** writes the file and stages it in one step. If the file turns out
-to be fixed already you get *No conflict markers found — the file has
-probably already been resolved.*
+carries **Resolve**, **Mine**, **Theirs** and an external-tool icon (*Open in
+merge tool*). **Mine** and **Theirs** take that whole file from one side in
+one click; the icon hands it to the merge tool you configured in Git.
+**Resolve** opens the conflict workshop on exactly that file.
 
 ### The conflict workshop
 
 The **conflict workshop** is the guided way through all the files at once.
-Four ways in, whichever you meet first: the button on the conflict banner,
-the **`…` menu → Tools → Conflict workshop**, the command palette, and the
-**Open conflict workshop** button on the error message you get when a pull
-or merge ends in conflicts.
+Usually you land in it by yourself, as soon as an operation ends in
+conflicts. The other ways in: the button on the conflict banner, the **`…`
+menu → Tools → Conflict workshop**, the command palette, **Resolve** on a
+conflicted row, and the **Open conflict workshop** button on an error
+message.
 
 It opens as a full view. The header names the operation, adds a **Step 2 of
 5** chip during a rebase, names the commit being applied (*Current commit:
@@ -564,6 +626,8 @@ It opens as a full view. The header names the operation, adds a **Step 2 of
 the title a plain-language subtitle says what you are doing — for example
 *You are merging feature/x into main — for each conflict, choose which
 version applies.*
+
+![Conflict workshop: sides named by branch, the base column, changed words marked](images/conflicts.png)
 
 The left column splits the files into **Open conflicts** and **Resolved**,
 with a bar above tracking *2 of 5 files resolved* for the session. You never
@@ -574,9 +638,17 @@ For the selected file you have three levels of attack. **Whole file:
 <side>** takes one side outright — the button is labelled with the real
 branch or commit name, not "ours". **Open mergetool** hands the file to your
 external tool. Or you work block by block: each block is headed **Conflict 2
-of 4**, shows both sides (and the base where one exists), and offers the two
-sides plus **Both (left first)** and **Both (right first)** — and, again, an
-editable box with the result once you have chosen. **Resolve & stage** only
+of 4**, shows both sides (and the base where there is one), and offers the two
+sides plus **Both (left first)** and **Both (right first)** — and an
+editable box with the result once you have chosen, so you can also type the
+merged version yourself. The **Base** column — the version both sides
+started from — is there whenever the two sides have one: terra-git asks git
+for it on every merge, pull, cherry-pick, revert, rebase and stash, whatever
+your own git settings say. Only a file both sides created from scratch has
+none.
+Within each side, the words that side changed against the base are
+highlighted in the side's colour (without a base, against the other side),
+so a one-word difference does not hide in a long line. **Resolve & stage** only
 lights up once every block in that file has an answer; it writes the file,
 stages it, and keeps the file's existing line endings.
 
@@ -598,6 +670,19 @@ left side is the new base (main); your change is on the right.* Cherry-pick
 and revert are labelled the same way, as *Current state (…)* against
 *Commit (…)*.
 
+**Conflicts without an operation.** Putting a stash back can conflict, too —
+when you bring changes along to another branch, when changes left behind come
+back, or with **Apply**/**Pop** in the stash list. No merge or rebase runs
+then, so the workshop works slightly differently: the subtitle names the
+stash, the columns read *Current state (branch)* and *Stashed changes*, and
+instead of Abort/Continue the header offers:
+
+- **Done** — once every file is resolved. After a *Pop* (and after bringing
+  changes along) the stash is removed only now; after *Apply* it stays.
+- **Give up conflicts** — puts the conflicted files back to their last
+  committed state. A copy lands under *Backups* first, and the stash stays in
+  the stash list, so nothing is lost.
+
 ## Rewriting history safely
 
 Everything in this chapter changes commits that already exist. Three things
@@ -614,8 +699,15 @@ its changes back into the staging area. Apart from an empty repository
 (*There is no commit to amend.*), **Amend** is refused only while a
 merge, rebase, cherry-pick or revert is running (*Not possible while an
 operation is running — continue or abort it first*). **Undo last commit**
-additionally refuses on a merge commit and on the repository's very first
-commit.
+additionally refuses on a merge commit. On the repository's very first commit
+it takes the branch back to "no commit yet": every file shows up as staged
+again, exactly as before that first commit, and `Ctrl+Z` / `Ctrl+Y` move
+between the two states. A backup of the commit is written first.
+
+The very first commit is no longer special anywhere else either: **Squash
+last n commits** and **Interactive rebase** are offered on it (squashing down
+to it makes one new first commit with the same content), and reverting it
+asks first, because the revert removes every file it added.
 
 ### Squash last n commits
 
@@ -704,7 +796,7 @@ is the interactive-rebase dialog); a merge icon, **Squash into the older
 commit**, folds a commit into the row below it and tags it **squashed**, and
 the same button undoes it; a trash icon, **Drop commit**, greys the commit
 out and tags it **dropped**, and restores it again. Squash is disabled when
-there is no older non-root commit beneath the row, and the oldest kept
+there is no older commit beneath the row, and the oldest kept
 commit cannot be a squash — it has nothing to fall into — which the workshop
 says before it lets you apply. A changed order shows as an **Order changed**
 tag in the footer.
@@ -722,10 +814,11 @@ before rewriting.*). Success reports *Commits rewritten*. If the rewrite
 hits a conflict, the workshop closes and the conflict banner takes over; if
 it fails for another reason, the workshop stays open with your edits intact.
 
-Two kinds of commit are protected and carry a lock: merge commits (*Merge
-commit — not editable*) and the repository's root commit, tagged **root**
-and pinned to the bottom (*The root commit can't be edited in this
-version*). A merge commit anywhere in the range blocks the entire rewrite,
+Merge commits are protected and carry a lock (*Merge commit — not
+editable*). The repository's very first commit, tagged **first commit**, can
+be edited, moved and dropped like any other — the workshop then rewrites the
+history from its very beginning. A merge commit anywhere in the range blocks
+the entire rewrite,
 with the banner *Range contains merge commits — not editable* and the button
 disabled.
 
@@ -748,9 +841,9 @@ palette; the keys are `Ctrl+Z` and `Ctrl+Y` (`Ctrl+Shift+Z` works too).
 
 These operations are recorded, under the names the app shows: Commit, Amend,
 Commit undo, Merge, Rebase onto, Interactive rebase, Squash, Cherry-pick,
-Revert, Branch switch to, Branch deletion, Stash drop, Backup restore. So
-undo can bring back a deleted branch or a dropped stash, not just move a
-branch tip — worth knowing, because it changes how boldly you can act.
+Revert, Branch switch to, Branch deletion, Stash drop, Backup restore,
+Discard, Discard change block, Reset. So undo can bring back a deleted branch, a
+dropped stash or discarded changes, not just move a branch tip — worth knowing, because it changes how boldly you can act.
 Starting a new operation clears the redo side.
 
 Two limits: the shortcuts are ignored while you are typing in a text field
@@ -776,6 +869,42 @@ situations:
 The reason behind all four is the same: an undo must never be the thing that
 throws work away.
 
+### Reset the branch to a commit
+
+*Reset current branch to here…* (commit action menu, or a row in the
+reflog) moves the current branch to that commit. The dialog names the
+target, how many commits leave the branch, and offers three modes:
+
+- **Soft** — the changes of those commits stay staged, ready to be
+  committed again (for example as one commit).
+- **Mixed** (the default) — they stay as unstaged changes.
+- **Hard** — everything after that point is removed from the working
+  directory too. If you have uncommitted changes, they are copied to
+  [Discarded changes](#discarded-changes) first; when that copy does not fit
+  the storage limit, the reset does not happen and the notice offers
+  *Manage backups* and *Raise limit*.
+
+If some of those commits are already on the remote, the dialog warns that
+publishing afterwards needs a force push. Every reset writes a backup of
+the old branch tip (it appears in the Backups dialog as *Reset*) and is one
+step on the undo stack.
+
+### Finding lost commits: the reflog
+
+Git records every position HEAD and each branch had, for about 90 days —
+the reflog. It is where commits are found again after a reset, a rebase or
+a deleted branch. Open it with **Reflog…** in the `…` menu or the command
+palette. The picker at the top switches between HEAD and the local
+branches; each row shows what happened (commit, checkout, reset, rebase,
+merge, pull…), the commit, its subject and when. Per row: **Show the changes
+of this step** (opens the compare view), **Create branch from here**,
+**Check out (detached)** and **Reset current branch to here**.
+
+For HEAD, terra-git's own backups appear as a group above the reflog: unlike
+reflog entries, they survive reflog expiry and garbage collection.
+
+![Reflog with terra-git's backups on top](images/reflog.png)
+
 ### Backups before history rewrites
 
 Before a history rewrite, terra-git anchors the state it is about to replace
@@ -785,17 +914,17 @@ expiry, so an old state is still recoverable weeks later.
 
 Backups are written before a **squash**, a **rebase onto another branch**,
 an **interactive rebase** (from the History dialog and from the commit
-workshop's *Rewrite commits* alike), an **amend**, and before a **restore**
-itself. Merge, cherry-pick and revert are not backed up — those are covered
+workshop's *Rewrite commits* alike), an **amend**, a **reset**, and before a
+**restore** itself. Merge, cherry-pick and revert are not backed up — those are covered
 by the undo stack.
 
 What is saved is the committed state of the branch tip, and nothing else.
 Uncommitted work is never in a backup, which is exactly why restoring
 insists on a clean working directory.
 
-**The Backups dialog** (`…` menu → **Manage** → **Backups…**) is headed
-*Backups (before history rewrites)* and states the rule itself: *Before every
-squash/rebase, terra-git automatically saves a backup of the previous state.
+**The Backups dialog** (`…` menu → **Manage** → **Backups…**) has two
+sections. The first, *Before history rewrites*, states the rule itself: *Before every
+squash, rebase, amend or reset, terra-git automatically saves a backup of the previous state.
 "Restore" hard-resets the current branch to it — the current state is backed
 up as well.*
 
@@ -822,6 +951,35 @@ there. Nothing expires on its own, so this is also where you tidy up once a
 rewrite has proven good. Empty, the dialog reads *No backups yet — they are
 created automatically before squash/rebase.*
 
+### Discarded changes
+
+The second section of the Backups dialog lists every discard, newest first:
+*4 files* or *Change block*, the first paths (all of them in the tooltip) and
+how long ago — and, above the list, how much space the copies take: *In use:
+46 MB of 500 MB*.
+
+The copies live in a folder of their own inside the repository's `.git`
+directory, so deleting one frees its space at once. They are never deleted
+automatically — not by size, not by age; you decide what goes. How much they
+may take is a setting: **Settings → App → Storage for discarded changes**,
+from 100 MB to 5 GB per repository, 500 MB by default.
+
+**When the storage is full**, a discard does not happen at all. The notice
+names the sizes — *Not discarded: the copy needs 120 MB, but the storage for
+discarded changes is at 450 MB of 500 MB* — and offers two ways out: **Manage
+backups** opens this dialog, where you delete copies you no longer need, and
+**Raise limit** opens the settings. Then discard again. The same applies to a
+restore that would overwrite later changes: its safety copy has to fit, too.
+The usage line turns red once the limit is reached.
+
+**Restore** puts the files back exactly as they were before the discard —
+modified files get their content back, untracked files reappear, and a
+deleted file that the discard brought back is deleted again. If a file has
+changed since the discard, terra-git names it and asks before overwriting;
+if you say yes, the current state of those files is copied first and shows
+up as its own entry (*Overwritten by a restore*), so even that step can be
+taken back. The trash button deletes a copy for good.
+
 ## Stashing and parking work
 
 terra-git has a full stash manager, not GitHub Desktop's single implicit
@@ -838,7 +996,9 @@ Each entry in the list offers four things. The eye icon (**View contents**)
 opens a preview. **Apply** (*Apply (keep)*) puts the changes back and leaves
 the stash in the list; **Pop** (*Apply & remove*) puts them back and deletes
 the entry — that is the whole difference, and it is the thing people
-hesitate over. The trash icon discards a stash after a confirmation, and
+hesitate over. If putting the changes back leaves files in conflict, Pop
+keeps the entry anyway and says so: resolve the conflicts first, then drop
+the stash yourself. The trash icon discards a stash after a confirmation, and
 that drop is undoable from the toolbar.
 
 Two details about the preview: it shows the stash's changes against its base
@@ -871,6 +1031,41 @@ explaining that a remote is what enables push and pull.
 
 Because **Manage remotes…** also sits in the push dropdown, you can fix a
 wrong URL at the moment a push fails.
+
+When you create a branch — in the branch menu or with **Branch from here…**
+in the history — **Publish right away (branch only)** puts it on the remote
+at once, without its commits: handy when others should already see the
+branch, or a merge request is to be opened early.
+
+### When pull, push or merge gets stuck
+
+terra-git turns the three refusals you meet most into a choice instead of an
+error message.
+
+**The branches have diverged.** Your branch and the remote branch both have
+new commits. What a pull does then is a setting — **Settings → App → When
+branches have diverged on pull**: **Merge** (the default; a merge commit
+joins both lines), **Rebase** (your commits go on top of the remote ones) or
+**Ask every time**. When it asks, the dialog *Branches have diverged* offers
+**Merge** and **Rebase**, with **Remember for this repository**. A
+`pull.rebase` or `pull.ff` in your own or the repository's git configuration
+always takes precedence over the setting.
+
+**Local changes are in the way.** git refuses a pull, merge or rebase that
+would overwrite uncommitted changes — tracked or untracked files alike. The
+dialog *Local changes in the way* lists the files git named and offers
+**Bring them along**: the changes go into a stash, the pull (or
+merge, or rebase) runs, and they come back afterwards. If the operation
+stops on conflicts, they wait in the stash until you continue or abort it;
+if putting them back conflicts, the conflict workshop opens on those files.
+**Commit first** closes the dialog so you can commit.
+
+**The push was rejected** because the remote branch has commits you do not
+have. The dialog *Push rejected* offers three ways: **Pull & merge, then
+push**, **Rebase onto the remote, then push** — if either stops on
+conflicts, resolve them in the workshop; after **Continue** terra-git asks
+*Push now?* — and **Force push (with lease)**, in red, which overwrites the
+remote branch with your history.
 
 ### The pull/merge request list
 
@@ -939,8 +1134,20 @@ entry already exists for this host. This can indicate a man-in-the-middle
 attack — when in doubt, cancel and verify the fingerprint through another
 channel.* Verify the fingerprint elsewhere before you accept it.
 
-If OpenSSH (`ssh-keyscan`/`ssh-keygen`) is not installed, terra-git says so
-instead of showing a fingerprint.
+terra-git reads the fingerprint through the same `ssh` that git uses, with
+every sign-in method switched off — the not yet trusted server is offered
+nothing, and your `known_hosts` is only written when you confirm. If OpenSSH
+(`ssh`/`ssh-keygen`) is not installed, terra-git says so instead of showing a
+fingerprint.
+
+SSH never waits for an answer in the background: for fetch, pull, push and
+clone terra-git starts it so that it never asks (no hidden prompt for a host
+key or a key passphrase that nobody can see). An unknown host leads straight
+to the dialog above; a key with a passphrase that is not loaded in an SSH
+agent ends with *SSH authentication failed* and **Manage SSH keys**; an
+unreachable server ends after 30 seconds as a network error. If you set your
+own SSH program (`core.sshCommand`, `GIT_SSH` or `GIT_SSH_COMMAND`, for
+example plink), terra-git leaves it alone.
 
 ## Testing pipelines locally
 
@@ -1109,6 +1316,34 @@ directories found in the HEAD tree.*
 The files you deselect vanish from disk but are not lost; disabling brings
 them all back.
 
+### Git LFS
+
+terra-git works with repositories that keep large files in Git LFS, as long
+as `git-lfs` is installed. Files tracked by LFS are committed as LFS
+pointers, exactly as on the command line, and switching branches, checking
+out a commit, discarding, putting a stash back and resetting write the real
+file content. Their diff does not show the pointer text: it says *Git LFS
+file* and compares the sizes of the old and the new content.
+
+A banner above the tabs speaks up in two cases:
+
+- **git-lfs is not installed** but the repository uses LFS: large files are
+  then only small pointer files on disk, and committing them could damage
+  them. **Install git-lfs** opens git-lfs.com; afterwards reopen the
+  repository. Operations that fail for this reason show the error *git-lfs
+  is missing* with the same button.
+- **LFS files were not downloaded** (for example after a clone with
+  `GIT_LFS_SKIP_SMUDGE`, or offline): *12 Git LFS files have not been
+  downloaded*. **Download LFS files** runs `git lfs pull` with progress in
+  the toolbar and can be cancelled like a fetch.
+
+**Moving files to LFS.** *Track with Git LFS* and *Track all \*.ext with Git
+LFS* in the file row's `⋯` menu run `git lfs track` for the file or its
+extension. The updated `.gitattributes` is staged right away, and a file
+git already tracks is staged again, now as an LFS pointer — the next commit
+moves it to LFS. Older commits keep the full file; rewriting them
+(`git lfs migrate`) is not part of terra-git.
+
 ## Settings
 
 Open Settings from the toolbar's `…` menu (gear icon) or from the command
@@ -1120,14 +1355,22 @@ identity before anything else, open or clone a repository first.
 
 - **Git identity** — name/email, saved globally or just for this
   repository; commit signing (GPG/SSH via your Git configuration) with a
-  "test signing" check.
+  "test signing" check. Signed commits, and every commit in a repository
+  with commit hooks (`pre-commit`, `prepare-commit-msg`, `commit-msg`,
+  `post-commit`, or `core.hooksPath` set, as with husky), are made by git
+  itself, so the hooks run exactly as on the command line.
 - **App** — the editor command used by "Open in editor", auto-fetch every
   5 minutes, **Auto-clean orphaned branches on pull** (a pull then also
   prunes dead remote refs and deletes orphaned local branches that are
   safely merged, undoably; switched off, they are only marked and you
   delete them yourself), and how long informational toast notices stay on
   screen before auto-dismissing (2/4/8 seconds, or never — error toasts
-  always stay until you close them). The installed terra-git version is
+  always stay until you close them). **When branches have diverged on
+  pull**: merge, rebase, or ask every time — a `pull.rebase`/`pull.ff` in your
+  git configuration takes precedence, but an answer you give in the dialog
+  (and one you remember for a repository) wins over both. **Storage for
+  discarded changes** (per repository, 100 MB to 5 GB): how much the copies of
+  discarded files may take. The installed terra-git version is
   printed at the foot of this section — that is the number to quote in a
   bug report, and it is also in the start screen's footer.
 - **Accounts** — personal access tokens for GitHub, GitLab and
@@ -1231,6 +1474,7 @@ The app has no cheat sheet of its own, so this is the reference.
 | `Esc` | Close a menu, the palette, the find bar or a dialog |
 | `Ctrl+Enter` | Commit — from the summary/description fields or the changes overview |
 | `Ctrl+A`, `Ctrl`/`Shift`-click | Select files in the changes lists |
+| `Ctrl`-click on a commit | Compare it with the selected commit |
 | `←` `→` `Home` `End` | Move between the Changes and History tabs |
 | `↑` `↓` `Home` `End` | Move through an open menu |
 | Arrows, `Space`, `Enter` | Changes overview: select, stage/unstage, open the diff |
@@ -1257,12 +1501,59 @@ Informational notices fade after the interval set in Settings → App;
 **errors never disappear on their own** and stay until you close them, so
 nothing is missed while you are away from the screen.
 
-Three errors carry a button that fixes the situation on the spot:
+**How an error is laid out.** The heading names where it happened, the error
+code and a short title — *shop : non_fast_forward — Push rejected*. Below it
+is the explanation in your language. When the error came from git itself,
+git's own output follows in a box of its own (in English for transfers,
+merges, rebases and commits, whatever your system language — that is what
+terra-git recognises errors by). However
+long that output is, the message never grows past the window: the box
+scrolls, and the buttons in the heading stay where they are — **Copy
+details** puts heading, text and git output on the clipboard (for a bug
+report or a web search), **Open log folder** opens terra-git's logs, where
+the complete output is kept even when the box shows only its end.
+
+These errors carry buttons that fix the situation on the spot:
 
 - **Open conflict workshop**, after a pull or merge ends in conflicts;
 - **Stash changes and switch**, when a branch switch is blocked by
   uncommitted work;
-- **Open stash list**, when changes had to be left in a stash.
+- **Open stash list**, when changes had to be left in a stash;
+- **Manage backups** / **Raise limit**, when the storage for discarded
+  changes is full;
+- **Manage accounts**, when signing in failed or access was denied;
+- **Manage SSH keys**, when the server rejected your SSH key;
+- **Manage remotes**, when the repository was not found on the remote;
+- **Try again**, after a fetch, pull or push failed for a network error (or
+  for a missing git-lfs, next to **Install git-lfs**);
+- **Set up Git identity**, when git has no name and e-mail address for a
+  commit;
+- **Create branch here…**, when a push fails because no branch is checked
+  out (detached HEAD) — the dialog can publish the new branch right away;
+- **Remove lock file**, when another git process seems to be working
+  (*Repository is locked*). It asks first, refuses a lock written in the
+  last few seconds, and repeats the operation afterwards;
+- **Trust this folder…**, when git refuses a repository that belongs to
+  another user. It adds exactly that folder to git's `safe.directory` list
+  and opens the repository;
+- **Enable long paths**, when a path is too long for Windows
+  (`core.longpaths` for this repository);
+- **Publish again** / **Remove upstream** / **Delete local branch (if
+  merged)…**, when the remote branch your branch follows was deleted. The
+  last one asks first, switches to the default branch and deletes the local
+  branch only if it is merged — unmerged work is kept, and the message says
+  so;
+- **Fetch full history and retry**, when the remote rejects a push from a
+  shallow clone;
+- **Merge anyway…**, when a merge or pull refuses two branches without a
+  common commit (*Unrelated histories*). It asks once more, then merges
+  with `--allow-unrelated-histories`; the merge is one undo step;
+- **Try again**, when a commit hook or the `pre-push` hook refused (*A git
+  hook stopped it*) — its output is in the details; fix what it reports first. A
+  successful retry clears the commit form like a normal commit;
+- **Commit without a signature** / **Signing settings**, when signing the
+  commit failed. The first commits this once without a signature and leaves
+  `commit.gpgsign` as it is.
 
 Those buttons are hidden while a dialog or the command palette is open and
 come back when you close it — a button only the mouse could reach would be a
@@ -1274,13 +1565,11 @@ trap for keyboard users. The message itself stays put either way.
   credential manager?) — accounts can be added in Settings.* — for HTTPS
   remotes this is your system credential helper, not terra-git; for the
   PR/MR list it is the token under Settings → Accounts.
-- *Push rejected: the remote branch has commits you don't have locally. Pull
-  first (merge/rebase) — or deliberately overwrite with a force push.* —
-  terra-git then puts up a **Push rejected** confirmation offering a force
-  push (`--force-with-lease`) right away. Saying yes overwrites the remote
-  branch with your local history, and teammates who already pulled it will
-  have to sort that out. Unless you are cleaning up after a rewrite you did
-  on purpose, pulling first is the right answer.
+- *Push rejected* — terra-git puts up the **Push rejected** dialog with its
+  three ways out (see [When pull, push or merge gets stuck](#when-pull-push-or-merge-gets-stuck)).
+  Unless you are cleaning up after a rewrite you did on purpose, pulling
+  first is the right answer; a force push overwrites the remote branch, and
+  teammates who already pulled it will have to sort that out.
 - *Rejected by the server (missing permission or protected branch). Check
   repository permissions and branch protection rules.* — usually branch
   protection on the default branch.
@@ -1293,6 +1582,16 @@ trap for keyboard users. The message itself stays put either way.
   read back.
 - *Not a Git repository.* and *There is no commit to amend.* — exactly what
   they say.
+
+terra-git also recognises these situations by name instead of reporting a
+plain *git command failed*: a leftover lock file (*Repository is locked*), a
+folder that belongs to another user (*Folder not trusted*), a missing git
+identity, a certificate the system does not trust (*Certificate not
+trusted* — allow it for that host under Settings → Accounts if you know the
+server), unrelated histories, a deleted remote branch, a push rejected
+because the clone is shallow, a path too long for Windows, a failed commit
+signature, and an SSH server that only offers host key types your SSH
+client no longer accepts.
 
 **Logs for a bug report.** `…` menu → **Open** → **Open log folder** opens
 terra-git's own log directory in your file manager. It holds one log file per day, named

@@ -2,13 +2,16 @@
   import { open } from "@tauri-apps/plugin-dialog";
   import { api } from "../api";
   import { workshopAvailable } from "../conflictWorkshop";
-  import { t } from "../i18n.svelte";
+  import { formatCount } from "../format";
+  import { t, tn } from "../i18n.svelte";
   import { tooltip } from "../tooltip";
   import {
     cancelRemoteOp,
     closeRepo,
     gitFetch,
+    gitFetchFrom,
     gitPull,
+    gitPullFrom,
     gitPush,
     gitPushForce,
     gitPushTo,
@@ -17,6 +20,8 @@
     openRepo,
     openWorkshop,
     prProvider,
+    publishBranchOnly,
+    pushTargetRemote,
     redoLast,
     savePrefs,
     showError,
@@ -35,6 +40,7 @@
 
   let repoMenuOpen = $state(false);
   let syncMenuOpen = $state(false);
+  let pullMenuOpen = $state(false);
   let moreMenuOpen = $state(false);
 
   async function browse() {
@@ -46,11 +52,18 @@
   const ahead = $derived(ui.status?.ahead ?? 0);
   const behind = $derived(ui.status?.behind ?? 0);
   const hasUpstream = $derived(!!ui.status?.upstream);
+  /** The checked-out branch (null when detached or unborn). */
+  const currentBranchName = $derived(ui.status?.branch ?? ui.repo?.currentBranch ?? null);
 
   // Conflict workshop: without a running operation there is nothing to resolve —
   // the entry stays visible (only greyed out) so the way there is known BEFORE
   // the first conflict arrives.
-  const conflictsReady = $derived(workshopAvailable(ui.status?.opState));
+  const conflictsReady = $derived(
+    workshopAvailable(
+      ui.status?.opState,
+      (ui.status?.unstaged ?? []).filter((e) => e.kind === "conflicted").length,
+    ),
+  );
   const conflictCount = $derived(
     (ui.status?.unstaged ?? []).filter((e) => e.kind === "conflicted").length,
   );
@@ -187,7 +200,13 @@
   {#if ui.busy}
     <span class="busy">
       <span class="spin"></span>
-      {#if ui.progress}
+      {#if ui.progress?.total != null}
+        {ui.busy} — {t("progress.items", {
+          done: formatCount(ui.progress.done ?? 0),
+          total: formatCount(ui.progress.total),
+        })}
+        ({ui.progress.percent}%)
+      {:else if ui.progress}
         {ui.busy} — {t(`progress.${ui.progress.phase}` as Parameters<typeof t>[0])}
         {ui.progress.percent}%
       {:else}
@@ -221,21 +240,96 @@
       <Icon name="refresh" size={14} />
       {t("toolbar.fetch")}
     </button>
-    <button
-      onclick={gitPull}
-      disabled={!!ui.busy || !!ui.cloning || !hasUpstream}
-      use:tooltip={hasUpstream ? "git pull" : t("toolbar.noUpstream")}
-    >
-      <Icon name="arrowDown" size={14} />
-      {t("toolbar.pull")}
-      {#if behind > 0}<span class="badge pull">{behind}</span>{/if}
-    </button>
+    <!-- Pull as a split button like Push: the main button pulls from the
+         upstream; the dropdown pulls/fetches from any remote. -->
+    <div class="push-group">
+      <button
+        data-testid="pull"
+        onclick={gitPull}
+        disabled={!!ui.busy || !!ui.cloning || !hasUpstream}
+        use:tooltip={hasUpstream ? "git pull" : t("toolbar.noUpstream")}
+      >
+        <Icon name="arrowDown" size={14} />
+        {t("toolbar.pull")}
+        {#if behind > 0}<span class="badge pull">{behind}</span>{/if}
+      </button>
+      <Menu bind:open={pullMenuOpen} align="right" width="280px">
+        {#snippet trigger({ toggle })}
+          <button
+            class="chev"
+            onclick={toggle}
+            disabled={!!ui.busy || !!ui.cloning || ui.remotes.length === 0}
+            aria-label={t("toolbar.pullOptions")}
+          >
+            <Icon name="chevronDown" size={12} />
+          </button>
+        {/snippet}
+        {#each ui.remotes as remote (remote.name)}
+          {@const available =
+            !!currentBranchName &&
+            ui.branches.some((b) => b.isRemote && b.name === `${remote.name}/${currentBranchName}`)}
+          <button
+            class="item ghost"
+            role="menuitem"
+            disabled={!available}
+            onclick={() => {
+              pullMenuOpen = false;
+              if (currentBranchName) gitPullFrom(remote.name, currentBranchName);
+            }}
+          >
+            <Icon name="arrowDown" size={14} />
+            {t("toolbar.pullFrom", { name: `${remote.name}/${currentBranchName ?? "…"}` })}
+            {#if !available}<span class="muted">{t("toolbar.notOnRemote")}</span>{/if}
+          </button>
+        {/each}
+        <div class="sep-h" role="separator"></div>
+        <button
+          class="item ghost"
+          role="menuitem"
+          onclick={() => {
+            pullMenuOpen = false;
+            gitFetchFrom();
+          }}
+        >
+          <Icon name="refresh" size={14} />
+          {t("toolbar.fetchAll")}
+        </button>
+        {#each ui.remotes as remote (remote.name)}
+          <button
+            class="item ghost"
+            role="menuitem"
+            onclick={() => {
+              pullMenuOpen = false;
+              gitFetchFrom(remote.name);
+            }}
+          >
+            <Icon name="refresh" size={14} />
+            {t("toolbar.fetchFrom", { name: remote.name })}
+          </button>
+        {/each}
+        <div class="sep-h" role="separator"></div>
+        <button
+          class="item ghost"
+          role="menuitem"
+          onclick={() => {
+            pullMenuOpen = false;
+            ui.modal = { kind: "remotes" };
+          }}
+        >
+          <Icon name="globe" size={14} />
+          {t("toolbar.manageRemotes")}
+        </button>
+      </Menu>
+    </div>
     <div class="push-group" class:primary-group={ahead > 0 || !hasUpstream}>
       <button
+        data-testid="push"
         class:primary={ahead > 0 || !hasUpstream}
         onclick={gitPush}
         disabled={!!ui.busy || !!ui.cloning}
-        use:tooltip={hasUpstream ? "git push" : "git push --set-upstream origin <branch>"}
+        use:tooltip={hasUpstream
+          ? "git push"
+          : `git push --set-upstream ${pushTargetRemote()} ${currentBranchName ?? "<branch>"}`}
       >
         <Icon name="arrowUp" size={14} />
         {t("toolbar.push")}
@@ -253,6 +347,34 @@
             <Icon name="chevronDown" size={12} />
           </button>
         {/snippet}
+        {#if !hasUpstream && ui.remotes.length > 0}
+          <!-- A new branch: with its commits, or the branch alone. -->
+          <button
+            class="item ghost"
+            role="menuitem"
+            onclick={() => {
+              syncMenuOpen = false;
+              gitPush();
+            }}
+          >
+            <Icon name="arrowUp" size={14} />
+            {tn("toolbar.publishWithCommits", ahead)}
+          </button>
+          <button
+            class="item ghost"
+            role="menuitem"
+            disabled={ahead === 0}
+            onclick={() => {
+              syncMenuOpen = false;
+              publishBranchOnly();
+            }}
+          >
+            <Icon name="branch" size={14} />
+            {t("toolbar.publishBranchOnly")}
+            <span class="muted">{t("toolbar.publishBranchOnlyHint")}</span>
+          </button>
+          <div class="sep-h" role="separator"></div>
+        {/if}
         {#each ui.remotes as remote (remote.name)}
           <button
             class="item ghost"
@@ -352,6 +474,17 @@
       <span class="muted">
         {conflictsReady ? t("conflictws.openN", { n: conflictCount }) : t("conflictws.idle")}
       </span>
+    </button>
+    <button
+      class="item ghost"
+      role="menuitem"
+      onclick={() => {
+        moreMenuOpen = false;
+        ui.modal = { kind: "reflog" };
+      }}
+    >
+      <Icon name="history" size={14} />
+      {t("reflog.menu")}
     </button>
     <div class="sep-h" role="separator"></div>
     <span class="menu-label">{t("toolbar.manage")}</span>

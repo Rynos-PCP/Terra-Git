@@ -59,7 +59,7 @@ export function offerConflictWorkshop(
 ): boolean {
   return (
     errorAction === "conflicts" &&
-    workshopAvailable(opState) &&
+    workshopAvailable(opState, conflictedCount) &&
     conflictedCount > 0 &&
     view !== "conflicts"
   );

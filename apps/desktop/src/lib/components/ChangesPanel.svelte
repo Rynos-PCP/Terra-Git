@@ -1,7 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
-  import { confirm } from "@tauri-apps/plugin-dialog";
+  import { confirm } from "../dialogs";
   import type { StatusEntry } from "../api";
   import { buildCommitMessage, parseCommitMessage } from "../commitMessage";
   import { clickSelect, pruneSelection, selectAll, type ClickMods } from "../fileSelection";
@@ -287,6 +287,19 @@
     if (canCommit) doCommit();
     else summaryEl?.focus();
   }
+
+  // A commit repeated from the error toast ("Try again", "Commit without a
+  // signature") clears the form too — it ran outside doCommit.
+  let seenCommits = ui.commitCount;
+  $effect(() => {
+    if (ui.commitCount === seenCommits) return;
+    seenCommits = ui.commitCount;
+    summary = "";
+    description = "";
+    coAuthors = "";
+    amend = false;
+    showCoAuthors = false;
+  });
 
   async function doCommit() {
     if (!canCommit) return;
@@ -582,7 +595,12 @@
         {#if committing}<span class="spin"></span>{/if}
         {t("changes.commitTo", { branch: ui.status?.branch ?? "HEAD" })}
       </button>
-      <button class="ghost undo" disabled={!canUndo} onclick={undoLastCommit}>
+      <button
+        class="ghost undo"
+        data-testid="undo-last-commit"
+        disabled={!canUndo}
+        onclick={undoLastCommit}
+      >
         <Icon name="undo" size={13} />
         {t("changes.undoLastCommit")}
       </button>

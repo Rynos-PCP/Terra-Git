@@ -14,6 +14,7 @@
     authorValid,
     changedCommitCount,
     commitChanged,
+    dropsDownToRoot,
     firstKeptIsSquash,
     workshopOrderChanged,
     type WorkshopEdit,
@@ -28,8 +29,10 @@
     ui.unpushed.length > 0 && ui.unpushed[ui.unpushed.length - 1].parentIds.length === 0,
   );
 
-  function isRoot(id: string): boolean {
-    return oldestIsRoot && ui.unpushed[ui.unpushed.length - 1].id === id;
+  /** The very first commit of the repo — editable like any other, it
+   *  only gets a label. */
+  function isRoot(c: UnpushedCommit): boolean {
+    return c.parentIds.length === 0;
   }
 
   /** The author was changed AND is invalid (empty / angle brackets). */
@@ -42,7 +45,7 @@
   const invalidAuthor = $derived(ui.unpushed.some((c) => badAuthor(c, ui.workshopEdits[c.id])));
 
   // Display order from the state (natural as a fallback while it is not loaded
-  // yet); the root stays pinned to the end of the list by the move() guard.
+  // yet).
   const ordered = $derived.by(() => {
     if (ui.workshopOrder.length !== ui.unpushed.length) return ui.unpushed;
     const byId = new Map(ui.unpushed.map((c) => [c.id, c]));
@@ -51,22 +54,21 @@
   });
   const orderMoved = $derived(workshopOrderChanged(ui.unpushed, ui.workshopOrder));
   const squashFirst = $derived(firstKeptIsSquash(ui.unpushed, ui.workshopEdits, ui.workshopOrder));
+  const dropsRoot = $derived(dropsDownToRoot(ui.unpushed, ui.workshopEdits));
 
-  /** Swaps the commit with its display neighbour; the root stays at the bottom. */
+  /** Swaps the commit with its display neighbour. */
   function move(id: string, dir: -1 | 1) {
     const arr = [...ui.workshopOrder];
     const i = arr.indexOf(id);
     const j = i + dir;
     if (i < 0 || j < 0 || j >= arr.length) return;
-    if (isRoot(id) || isRoot(arr[j])) return;
     [arr[i], arr[j]] = [arr[j], arr[i]];
     ui.workshopOrder = arr;
   }
 
-  /** A squash needs an older (non-root) commit below it. */
+  /** A squash needs an older commit below it to fall into. */
   function canSquashAt(i: number): boolean {
-    const below = ordered[i + 1];
-    return !!below && !isRoot(below.id);
+    return !!ordered[i + 1];
   }
 
   // Expanded cards: only explicit user toggles land in the buffer; HEAD is open
@@ -127,7 +129,7 @@
     <ul class="commits" class:no-base={oldestIsRoot}>
       {#each ordered as c, i (c.id)}
         {@const e = ui.workshopEdits[c.id]}
-        {@const ro = c.isMerge || isRoot(c.id)}
+        {@const ro = c.isMerge}
         {@const bad = badAuthor(c, e)}
         {@const edited = commitChanged(c, e)}
         {@const open = isOpen(c)}
@@ -145,10 +147,8 @@
               <code class="sha">{c.id.slice(0, 8)}</code>
               <span class="subject">{e?.subject || c.subject}</span>
               {#if c.isHead}<span class="tag">{t("workshop.head")}</span>{/if}
-              {#if isRoot(c.id)}
-                <span class="tag" use:tooltip={t("workshop.rootReadonly")}
-                  >{t("workshop.root")}</span
-                >
+              {#if isRoot(c)}
+                <span class="tag" use:tooltip={t("workshop.rootHint")}>{t("workshop.root")}</span>
               {/if}
               {#if e?.dropped}
                 <span class="tag drop-tag">{t("workshop.dropped")}</span>
@@ -171,7 +171,7 @@
               <button
                 class="ghost iconbtn"
                 onclick={() => move(c.id, 1)}
-                disabled={i === ordered.length - 1 || isRoot(ordered[i + 1].id)}
+                disabled={i === ordered.length - 1}
                 use:tooltip={t("rebase.moveDown")}
               >
                 <Icon name="arrowDown" size={13} />
@@ -195,10 +195,7 @@
                 <Icon name={e.dropped ? "undo" : "trash"} size={14} />
               </button>
             {:else if ro}
-              <span
-                class="lock"
-                use:tooltip={c.isMerge ? t("workshop.mergeReadonly") : t("workshop.rootReadonly")}
-              >
+              <span class="lock" use:tooltip={t("workshop.mergeReadonly")}>
                 <Icon name="lock" size={13} />
               </span>
             {/if}
@@ -276,6 +273,8 @@
     {/if}
     {#if squashFirst}
       <p class="banner error"><Icon name="alert" size={14} />{t("rebase.warnFirstSquash")}</p>
+    {:else if dropsRoot}
+      <p class="banner error"><Icon name="alert" size={14} />{t("rebase.warnAllDroppedRoot")}</p>
     {/if}
 
     <footer>
@@ -296,7 +295,8 @@
           (pending === 0 && !orderMoved) ||
           hasMerge ||
           invalidAuthor ||
-          squashFirst}
+          squashFirst ||
+          dropsRoot}
       >
         {#if ui.busy}<span class="spin"></span>{/if}
         {t("workshop.apply")}

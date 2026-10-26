@@ -283,6 +283,7 @@
             {#each ui.recents as entry (entry.path)}
               <div
                 class="recent"
+                data-path={entry.path}
                 role="button"
                 tabindex="0"
                 onclick={(e) => {

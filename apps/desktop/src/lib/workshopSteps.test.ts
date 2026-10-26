@@ -5,6 +5,7 @@ import {
   buildWorkshopSteps,
   changedCommitCount,
   commitChanged,
+  dropsDownToRoot,
   firstKeptIsSquash,
   workshopOrderChanged,
   type WorkshopEdit,
@@ -75,16 +76,17 @@ describe("buildWorkshopSteps", () => {
     expect(r.steps.map((s) => s.action)).toEqual(["pick", "pick", "drop"]);
   });
 
-  it("root within reach: the oldest is the root -> base=root, root read-only (not in steps)", () => {
+  it("root within reach: empty base (--root), the root is a step like any other", () => {
     const rootRange = [c("C", ["B"]), c("B", ["A"]), c("A", [])]; // A is the root (no parents)
     const edits = {
-      C: edit({ subject: "new" }),
+      C: edit({ subject: "S-C" }),
       B: edit({ subject: "S-B" }),
-      A: edit({ subject: "S-A" }),
+      A: edit({ subject: "new root" }),
     };
     const r = buildWorkshopSteps(rootRange, edits)!;
-    expect(r.baseId).toBe("A");
-    expect(r.steps.map((s) => s.commitId)).toEqual(["B", "C"]); // A (root) not included
+    expect(r.baseId).toBe("");
+    expect(r.steps.map((s) => s.commitId)).toEqual(["A", "B", "C"]);
+    expect(r.steps[0]).toMatchObject({ action: "reword", message: "new root" });
   });
 
   it("subject AND author changed -> reword with message and author", () => {
@@ -167,16 +169,17 @@ describe("buildWorkshopSteps with order and squash", () => {
     expect(r.steps[1].message).toBeUndefined();
   });
 
-  it("the root stays the base even on a reorder and falls out of the steps", () => {
+  it("the root can be moved like any other commit", () => {
     const rootRange = [c("C", ["B"]), c("B", ["A"]), c("A", [])];
     const edits = {
       C: edit({ subject: "S-C" }),
       B: edit({ subject: "S-B" }),
       A: edit({ subject: "S-A" }),
     };
-    const r = buildWorkshopSteps(rootRange, edits, ["B", "C", "A"])!;
-    expect(r.baseId).toBe("A");
-    expect(r.steps.map((s) => s.commitId)).toEqual(["C", "B"]);
+    // Display order newest first: A moved to the top -> applied last.
+    const r = buildWorkshopSteps(rootRange, edits, ["A", "C", "B"])!;
+    expect(r.baseId).toBe("");
+    expect(r.steps.map((s) => s.commitId)).toEqual(["B", "C", "A"]);
   });
 });
 
@@ -261,5 +264,17 @@ describe("changedCommitCount", () => {
       A: edit({ subject: "S-A" }), // unchanged
     };
     expect(changedCommitCount(commits, edits)).toBe(1);
+  });
+});
+
+describe("dropsDownToRoot", () => {
+  it("only when every commit including the first one is dropped", () => {
+    const both = { R: edit({ dropped: true }), T: edit({ dropped: true }) };
+    expect(dropsDownToRoot([c("T", ["R"]), c("R", [])], both)).toBe(true);
+    expect(dropsDownToRoot([c("T", ["R"]), c("R", [])], { T: edit({ dropped: true }) })).toBe(
+      false,
+    );
+    // Not down to the root: the branch simply goes back to its base.
+    expect(dropsDownToRoot([c("T", ["R"]), c("R", ["B"])], both)).toBe(false);
   });
 });

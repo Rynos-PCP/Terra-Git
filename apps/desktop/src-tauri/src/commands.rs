@@ -13,9 +13,10 @@ use tauri::Manager;
 use tg_auth::{KeyringStore, TokenStore};
 use tg_domain::{
     BackupInfo, BlameLine, BranchInfo, ChangeRequest, ChangeRequestList, CloneOptions, CommitInfo,
-    FileDiff, GitProgress, ImageDiff, NewChangeRequest, OpContext, ProviderAccount, ProviderKind,
-    RemoteInfo, RepoInfo, RepoOpState, RepoStatus, ResetMode, StashInfo, SubmoduleInfo, TagInfo,
-    UnchangedInfo, UndoAction, UndoEntry, UndoStatus, UnpushedCommit, WorktreeInfo,
+    DiscardedInfo, FileDiff, GitProgress, ImageDiff, LfsState, NewChangeRequest, OpContext,
+    ProviderAccount, ProviderKind, ReflogEntry, RemoteInfo, RepoInfo, RepoOpState, RepoStatus,
+    ResetMode, StashApplyOutcome, StashInfo, SubmoduleInfo, TagInfo, UnchangedInfo, UndoAction,
+    UndoEntry, UndoStatus, UnpushedCommit, WorktreeInfo,
 };
 use tg_git_engine::{error::GitEngineError, prelude::*};
 use tg_providers::{parse_remote_url, ProviderClient};
@@ -157,6 +158,7 @@ pub async fn delete_repo(app: AppHandle, path: String) -> CmdResult<()> {
         return Err(CommandError {
             code: "not_a_directory".into(),
             message: "Not a directory".into(),
+            ..Default::default()
         });
     }
     // Guard 1: never trash reparse points (symlink/junction) — is_dir() follows
@@ -169,6 +171,7 @@ pub async fn delete_repo(app: AppHandle, path: String) -> CmdResult<()> {
         return Err(CommandError {
             code: "invalid_target".into(),
             message: "Not a regular directory (reparse point)".into(),
+            ..Default::default()
         });
     }
     // Guard 2: the recents list as a sanity filter. IMPORTANT: it is NOT an
@@ -179,6 +182,7 @@ pub async fn delete_repo(app: AppHandle, path: String) -> CmdResult<()> {
         return Err(CommandError {
             code: "not_a_recent".into(),
             message: "Path is not a known repository".into(),
+            ..Default::default()
         });
     }
     // Guard 3: unforgeable confirmation through a NATIVE OS dialog. Every
@@ -209,6 +213,7 @@ pub async fn delete_repo(app: AppHandle, path: String) -> CmdResult<()> {
         return Err(CommandError {
             code: "cancelled".into(),
             message: "Deletion cancelled".into(),
+            ..Default::default()
         });
     }
     let moved = tauri::async_runtime::spawn_blocking(move || trash::delete(&p))
@@ -217,6 +222,7 @@ pub async fn delete_repo(app: AppHandle, path: String) -> CmdResult<()> {
     moved.map_err(|e| CommandError {
         code: "trash_failed".into(),
         message: e.to_string(),
+        ..Default::default()
     })?;
     crate::recents::remove(&app, &path);
     Ok(())
@@ -309,6 +315,7 @@ pub async fn undo_last(app: AppHandle, path: String) -> CmdResult<UndoEntry> {
         return Err(CommandError {
             code: "nothing_to_undo".into(),
             message: "Nothing to undo".into(),
+            ..Default::default()
         });
     };
     // Guard: the branch must still sit where the operation left it — otherwise
@@ -327,6 +334,7 @@ pub async fn undo_last(app: AppHandle, path: String) -> CmdResult<UndoEntry> {
                 message:
                     "The branch has changed in the meantime — undoing this step is no longer safe"
                         .into(),
+                ..Default::default()
             });
         }
     }
@@ -366,6 +374,7 @@ pub async fn redo_last(app: AppHandle, path: String) -> CmdResult<UndoEntry> {
         return Err(CommandError {
             code: "nothing_to_redo".into(),
             message: "Nothing to redo".into(),
+            ..Default::default()
         });
     };
     if let (
@@ -380,6 +389,7 @@ pub async fn redo_last(app: AppHandle, path: String) -> CmdResult<UndoEntry> {
             return Err(CommandError {
                 code: "undo_stale".into(),
                 message: "The branch has changed in the meantime — redo is no longer safe".into(),
+                ..Default::default()
             });
         }
     }
@@ -409,9 +419,36 @@ pub async fn redo_last(app: AppHandle, path: String) -> CmdResult<UndoEntry> {
     }
 }
 
+/// Stages files. Large sets (user report: ~25k files appeared frozen) report
+/// a file counter over `on_progress` and can be cancelled;
+/// small ones stay a quick in-process call without touching the op registry
+/// (so they never displace the cancel token of a running fetch/pull/push).
 #[tauri::command]
-pub async fn stage_files(path: String, files: Vec<String>) -> CmdResult<()> {
-    blocking(move || with_index_lock(|| Git2Engine.stage(&PathBuf::from(path), &files))).await
+pub async fn stage_files(
+    app: AppHandle,
+    path: String,
+    files: Vec<String>,
+    on_progress: tauri::ipc::Channel<GitProgress>,
+) -> CmdResult<()> {
+    let large = files.len() >= tg_git_engine::ops::STAGE_PROGRESS_MIN;
+    let token = if large {
+        app.state::<OpRegistry>().register(&path)
+    } else {
+        tg_git_engine::CancelToken::new()
+    };
+    let p = path.clone();
+    let result = blocking(move || {
+        with_index_lock(|| {
+            Git2Engine.stage_with_progress(&PathBuf::from(p), &files, &token, &mut |pr| {
+                let _ = on_progress.send(pr);
+            })
+        })
+    })
+    .await;
+    if large {
+        app.state::<OpRegistry>().unregister(&path);
+    }
+    result
 }
 
 #[tauri::command]
@@ -419,9 +456,102 @@ pub async fn unstage_files(path: String, files: Vec<String>) -> CmdResult<()> {
     blocking(move || with_index_lock(|| Git2Engine.unstage(&PathBuf::from(path), &files))).await
 }
 
+/// Records a protected discard on the undo stack: undo writes the snapshot's
+/// "before" back, redo its "after" (both refuse to overwrite later changes).
+fn push_discard_undo(app: &AppHandle, path: &str, op: &str, detail: String, reference: String) {
+    app.state::<UndoState>().push(
+        path,
+        UndoEntry {
+            op: op.into(),
+            detail: Some(detail),
+            timestamp: now_ts(),
+            undo: UndoAction::RestoreDiscarded {
+                reference: reference.clone(),
+            },
+            redo: UndoAction::ReapplyDiscarded { reference },
+        },
+    );
+}
+
+/// Storage limit of the discard store when the frontend sends none (the
+/// setting's default).
+const DEFAULT_DISCARD_LIMIT: u64 = 500 * 1024 * 1024;
+
+/// Discard with a copy of ALL affected files beforehand. If
+/// the copy does not fit into the store's limit (a setting), nothing is
+/// discarded: `discard_store_full` — the user frees space or raises the limit.
 #[tauri::command]
-pub async fn discard_files(path: String, files: Vec<String>) -> CmdResult<()> {
-    blocking(move || with_index_lock(|| Git2Engine.discard(&PathBuf::from(path), &files))).await
+pub async fn discard_files(
+    app: AppHandle,
+    path: String,
+    files: Vec<String>,
+    limit_bytes: Option<u64>,
+    // Large sets: a file counter, and the copy can be cancelled (like staging).
+    on_progress: tauri::ipc::Channel<GitProgress>,
+) -> CmdResult<()> {
+    let p = path.clone();
+    let detail = match files.as_slice() {
+        [one] => one.clone(),
+        many => many.len().to_string(),
+    };
+    let large = files.len() >= tg_git_engine::ops::STAGE_PROGRESS_MIN;
+    let token = if large {
+        app.state::<OpRegistry>().register(&path)
+    } else {
+        tg_git_engine::CancelToken::new()
+    };
+    let result = blocking(move || {
+        with_index_lock(|| {
+            Git2Engine.discard_protected_with_progress(
+                &PathBuf::from(p),
+                &files,
+                limit_bytes.unwrap_or(DEFAULT_DISCARD_LIMIT),
+                &token,
+                &mut |pr| {
+                    let _ = on_progress.send(pr);
+                },
+            )
+        })
+    })
+    .await;
+    if large {
+        app.state::<OpRegistry>().unregister(&path);
+    }
+    let reference = result?;
+    push_discard_undo(&app, &path, "discard", detail, reference);
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn list_discarded(path: String) -> CmdResult<Vec<DiscardedInfo>> {
+    blocking(move || Git2Engine.discarded(&PathBuf::from(path))).await
+}
+
+/// Writes a snapshot's "before" state back. Files changed since are reported
+/// (`discard_restore_conflict`) unless `force`.
+#[tauri::command]
+pub async fn restore_discarded(
+    path: String,
+    name: String,
+    force: Option<bool>,
+    limit_bytes: Option<u64>,
+) -> CmdResult<()> {
+    blocking(move || {
+        with_index_lock(|| {
+            Git2Engine.restore_discarded(
+                &PathBuf::from(path),
+                &name,
+                force.unwrap_or(false),
+                limit_bytes.unwrap_or(DEFAULT_DISCARD_LIMIT),
+            )
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn delete_discarded(path: String, name: String) -> CmdResult<()> {
+    blocking(move || Git2Engine.delete_discarded(&PathBuf::from(path), &name)).await
 }
 
 #[tauri::command]
@@ -430,8 +560,11 @@ pub async fn create_commit(
     path: String,
     message: String,
     amend: bool,
+    // "Commit once without a signature" after `signing_failed`.
+    unsigned: Option<bool>,
 ) -> CmdResult<String> {
     let p = path.clone();
+    let unsigned = unsigned.unwrap_or(false);
     with_reset_undo(
         &app,
         &path,
@@ -441,7 +574,7 @@ pub async fn create_commit(
         // No lock of our own: with_reset_undo takes the index lock around
         // snapshots AND mutation together.
         ResetMode::Soft,
-        move || Git2Engine.commit(&PathBuf::from(p), &message, amend),
+        move || Git2Engine.commit_with(&PathBuf::from(p), &message, amend, unsigned),
     )
     .await
 }
@@ -511,12 +644,12 @@ pub async fn stash_push(path: String, message: String, files: Vec<String>) -> Cm
 }
 
 #[tauri::command]
-pub async fn stash_apply(path: String, index: usize) -> CmdResult<()> {
+pub async fn stash_apply(path: String, index: usize) -> CmdResult<StashApplyOutcome> {
     blocking(move || with_index_lock(|| Git2Engine.stash_apply(&PathBuf::from(path), index))).await
 }
 
 #[tauri::command]
-pub async fn stash_pop(path: String, index: usize) -> CmdResult<()> {
+pub async fn stash_pop(path: String, index: usize) -> CmdResult<StashApplyOutcome> {
     blocking(move || with_index_lock(|| Git2Engine.stash_pop(&PathBuf::from(path), index))).await
 }
 
@@ -614,7 +747,13 @@ pub async fn delete_branch(
 }
 
 #[tauri::command]
-pub async fn merge_branch(app: AppHandle, path: String, name: String) -> CmdResult<String> {
+pub async fn merge_branch(
+    app: AppHandle,
+    path: String,
+    name: String,
+    // The user's "merge anyway" after `unrelated_histories`.
+    allow_unrelated: Option<bool>,
+) -> CmdResult<String> {
     let p = path.clone();
     let n = name.clone();
     with_reset_undo(
@@ -623,7 +762,13 @@ pub async fn merge_branch(app: AppHandle, path: String, name: String) -> CmdResu
         "merge",
         Some(name),
         ResetMode::Hard,
-        move || Git2Engine.merge_branch(&PathBuf::from(p), &n),
+        move || {
+            if allow_unrelated.unwrap_or(false) {
+                Git2Engine.merge_unrelated(&PathBuf::from(p), &n)
+            } else {
+                Git2Engine.merge_branch(&PathBuf::from(p), &n)
+            }
+        },
     )
     .await
 }
@@ -705,6 +850,265 @@ pub async fn read_conflict(path: String, file: String) -> CmdResult<tg_domain::C
 pub async fn save_resolution(path: String, file: String, content: String) -> CmdResult<()> {
     blocking(move || {
         with_index_lock(|| Git2Engine.save_resolution(&PathBuf::from(path), &file, &content))
+    })
+    .await
+}
+
+/// Publishes the current branch without its unpushed commits.
+#[tauri::command]
+pub async fn publish_branch_only(
+    app: AppHandle,
+    path: String,
+    remote: String,
+    on_progress: tauri::ipc::Channel<GitProgress>,
+) -> CmdResult<String> {
+    let token = app.state::<OpRegistry>().register(&path);
+    let p = path.clone();
+    let result = blocking(move || {
+        Git2Engine.publish_branch_only(&PathBuf::from(p), &remote, &token, &mut |pr| {
+            let _ = on_progress.send(pr);
+        })
+    })
+    .await;
+    app.state::<OpRegistry>().unregister(&path);
+    result
+}
+
+/// Whether a git program runs on this machine. Then a lock may be its own
+/// however old it is — a commit waiting in its editor holds `index.lock` for
+/// as long as the editor stays open. Best effort: when the process list cannot
+/// be read, the engine's age check alone decides.
+fn git_running() -> bool {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        Command::new("tasklist")
+            .args(["/FI", "IMAGENAME eq git.exe", "/FO", "CSV", "/NH"])
+            .creation_flags(0x0800_0000)
+            .output()
+            .is_ok_and(|o| {
+                String::from_utf8_lossy(&o.stdout)
+                    .to_ascii_lowercase()
+                    .contains("\"git.exe\"")
+            })
+    }
+    #[cfg(not(windows))]
+    {
+        Command::new("pgrep")
+            .args(["-x", "git"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success())
+    }
+}
+
+/// Removes a leftover `index.lock` — `lock` is the one git's
+/// message named (a submodule's, a worktree's), if any. Refused while this app
+/// runs an operation on the repo, and while any git program runs. `false` when
+/// there was none.
+#[tauri::command]
+pub async fn remove_index_lock(
+    app: AppHandle,
+    path: String,
+    lock: Option<String>,
+) -> CmdResult<bool> {
+    if app.state::<OpRegistry>().is_running(&path) {
+        return Err(CommandError {
+            code: "invalid_operation".into(),
+            message: "An operation is still running in this repository".into(),
+            detail: None,
+        });
+    }
+    blocking(move || {
+        if git_running() {
+            return Err(tg_git_engine::error::GitEngineError::InvalidOperation(
+                "Another git program is running (a terminal, your editor, another tool) — \
+                 the lock may be its own. Wait for it or close it, then try again."
+                    .into(),
+            ));
+        }
+        let named = lock.map(PathBuf::from);
+        with_index_lock(|| {
+            tg_git_engine::remedies::remove_index_lock(&PathBuf::from(path), named.as_deref())
+        })
+    })
+    .await
+}
+
+/// Marks exactly this folder as safe for git (`safe.directory`).
+#[tauri::command]
+pub async fn trust_directory(path: String) -> CmdResult<()> {
+    blocking(move || tg_git_engine::remedies::trust_directory(&PathBuf::from(path))).await
+}
+
+/// Removes the upstream of the current branch (`upstream_gone`).
+#[tauri::command]
+pub async fn unset_upstream(path: String) -> CmdResult<()> {
+    blocking(move || tg_git_engine::remedies::unset_upstream(&PathBuf::from(path))).await
+}
+
+/// `git fetch --unshallow` with progress (`shallow_rejected`).
+#[tauri::command]
+pub async fn fetch_unshallow(
+    app: AppHandle,
+    path: String,
+    on_progress: tauri::ipc::Channel<GitProgress>,
+) -> CmdResult<String> {
+    let token = app.state::<OpRegistry>().register(&path);
+    let p = path.clone();
+    let result = blocking(move || {
+        tg_git_engine::remedies::fetch_unshallow(&PathBuf::from(p), &token, &mut |pr| {
+            let _ = on_progress.send(pr);
+        })
+    })
+    .await;
+    app.state::<OpRegistry>().unregister(&path);
+    result
+}
+
+/// Whether the app answers its own confirmation questions with OK — only when
+/// started with `TERRA_GIT_E2E_ACCEPT_DIALOGS` (the E2E tests: WebDriver cannot
+/// reach a native dialog). Debug builds only: the E2E suite drives
+/// `target/debug`, and in a release build a stray variable must never be able
+/// to switch off every confirmation.
+#[tauri::command]
+pub fn e2e_accept_dialogs() -> bool {
+    cfg!(debug_assertions)
+        && std::env::var_os("TERRA_GIT_E2E_ACCEPT_DIALOGS").is_some_and(|v| !v.is_empty())
+}
+
+/// Git LFS in the repository: used, installed, objects missing.
+#[tauri::command]
+pub async fn lfs_state(path: String) -> CmdResult<LfsState> {
+    blocking(move || tg_git_engine::lfs::state(&PathBuf::from(path))).await
+}
+
+/// "Track with LFS": `git lfs track <pattern>`, `.gitattributes` and `file`
+/// restaged. Writes the index, hence under the lock.
+#[tauri::command]
+pub async fn lfs_track(path: String, pattern: String, file: String) -> CmdResult<()> {
+    blocking(move || {
+        with_index_lock(|| tg_git_engine::lfs::track(&PathBuf::from(path), &pattern, &file))
+    })
+    .await
+}
+
+/// `git lfs pull`: downloads the missing LFS objects and writes their content.
+/// Writes the worktree, hence under the lock; cancellable.
+#[tauri::command]
+pub async fn lfs_pull(
+    app: AppHandle,
+    path: String,
+    on_progress: tauri::ipc::Channel<GitProgress>,
+) -> CmdResult<String> {
+    let token = app.state::<OpRegistry>().register(&path);
+    let p = path.clone();
+    let result = blocking(move || {
+        with_index_lock(|| {
+            tg_git_engine::lfs::pull(&PathBuf::from(p), &token, &mut |pr| {
+                let _ = on_progress.send(pr);
+            })
+        })
+    })
+    .await;
+    app.state::<OpRegistry>().unregister(&path);
+    result
+}
+
+/// A reflog — `HEAD` or `refs/heads/<branch>`.
+#[tauri::command]
+pub async fn get_reflog(
+    path: String,
+    reference: String,
+    limit: usize,
+) -> CmdResult<Vec<ReflogEntry>> {
+    blocking(move || Git2Engine.reflog(&PathBuf::from(path), &reference, limit)).await
+}
+
+/// Moves the current branch to `commit` — one undo step; a
+/// hard reset first copies uncommitted work into the discard store.
+#[tauri::command]
+pub async fn reset_to(
+    app: AppHandle,
+    path: String,
+    commit: String,
+    mode: ResetMode,
+    limit_bytes: Option<u64>,
+) -> CmdResult<String> {
+    let p = path.clone();
+    let detail = Some(commit.chars().take(8).collect::<String>());
+    let limit = limit_bytes.unwrap_or(DEFAULT_DISCARD_LIMIT);
+    with_reset_undo(&app, &path, "reset", detail, mode, move || {
+        Git2Engine
+            .reset_to(&PathBuf::from(p), &commit, mode, limit)
+            .map(|snapshot| snapshot.unwrap_or_default())
+    })
+    .await
+}
+
+/// Commits reachable from `to` but not from `from`.
+#[tauri::command]
+pub async fn log_range(
+    path: String,
+    from: String,
+    to: String,
+    limit: usize,
+) -> CmdResult<Vec<CommitInfo>> {
+    blocking(move || Git2Engine.log_range(&PathBuf::from(path), &from, &to, limit)).await
+}
+
+/// Streams the diff between two commits/refs.
+#[tauri::command]
+pub async fn get_range_diff_stream(
+    path: String,
+    from: String,
+    to: String,
+    max_files: usize,
+    on_file: tauri::ipc::Channel<FileDiff>,
+) -> CmdResult<usize> {
+    blocking(move || {
+        Git2Engine.range_diff_stream(&PathBuf::from(path), &from, &to, max_files, &mut |fd| {
+            on_file.send(fd).is_ok()
+        })
+    })
+    .await
+}
+
+#[tauri::command]
+pub async fn merge_base(path: String, a: String, b: String) -> CmdResult<String> {
+    blocking(move || Git2Engine.merge_base(&PathBuf::from(path), &a, &b)).await
+}
+
+/// How many commits `to` has that `from` lacks — "n to take over" in the
+/// update-from dialog.
+#[tauri::command]
+pub async fn count_commits(path: String, from: String, to: String) -> CmdResult<u32> {
+    blocking(move || Git2Engine.count_commits(&PathBuf::from(path), &from, &to)).await
+}
+
+/// The repository's default branch (remote HEAD, else local main/master).
+#[tauri::command]
+pub async fn default_branch(path: String) -> CmdResult<Option<String>> {
+    blocking(move || Git2Engine.default_branch(&PathBuf::from(path))).await
+}
+
+/// Gives up conflicts that belong to no running operation (stash applied with
+/// conflicts): back to HEAD, after a copy into the discard store.
+#[tauri::command]
+pub async fn abandon_conflicts(
+    path: String,
+    files: Vec<String>,
+    limit_bytes: Option<u64>,
+) -> CmdResult<String> {
+    blocking(move || {
+        with_index_lock(|| {
+            Git2Engine.abandon_conflicts(
+                &PathBuf::from(path),
+                &files,
+                limit_bytes.unwrap_or(DEFAULT_DISCARD_LIMIT),
+            )
+        })
     })
     .await
 }
@@ -853,11 +1257,23 @@ pub async fn apply_hunk(
 }
 
 #[tauri::command]
-pub async fn discard_hunk(path: String, file: String, hunk_index: usize) -> CmdResult<()> {
-    blocking(move || {
-        with_index_lock(|| Git2Engine.discard_hunk(&PathBuf::from(path), &file, hunk_index))
+pub async fn discard_hunk(
+    app: AppHandle,
+    path: String,
+    file: String,
+    hunk_index: usize,
+    limit_bytes: Option<u64>,
+) -> CmdResult<()> {
+    let (p, f) = (path.clone(), file.clone());
+    let limit = limit_bytes.unwrap_or(DEFAULT_DISCARD_LIMIT);
+    let reference = blocking(move || {
+        with_index_lock(|| {
+            Git2Engine.discard_hunk_protected(&PathBuf::from(p), &f, hunk_index, limit)
+        })
     })
-    .await
+    .await?;
+    push_discard_undo(&app, &path, "discardHunk", file, reference);
+    Ok(())
 }
 
 #[tauri::command]
@@ -1086,6 +1502,7 @@ pub async fn provider_add_account(
         return Err(CommandError {
             code: "invalid_host".into(),
             message: "Please enter a host name (e.g. github.com)".into(),
+            ..Default::default()
         });
     }
     let token = token.trim().to_string();
@@ -1093,6 +1510,7 @@ pub async fn provider_add_account(
         return Err(CommandError {
             code: "invalid_token".into(),
             message: "Please enter a token".into(),
+            ..Default::default()
         });
     }
 
@@ -1139,6 +1557,7 @@ async fn provider_context(app: &AppHandle, path: &str) -> CmdResult<ProviderCont
         .ok_or_else(|| CommandError {
             code: "no_remote".into(),
             message: "This repository has no remote".into(),
+            ..Default::default()
         })?;
     let target = parse_remote_url(&remote.url).ok_or_else(|| CommandError {
         code: "no_remote".into(),
@@ -1146,6 +1565,7 @@ async fn provider_context(app: &AppHandle, path: &str) -> CmdResult<ProviderCont
             "Remote URL is not recognizable as a hosting provider: {}",
             remote.url
         ),
+        ..Default::default()
     })?;
 
     // F27: subpath accounts ("example.com/gitlab") match too — the subpath is
@@ -1154,6 +1574,7 @@ async fn provider_context(app: &AppHandle, path: &str) -> CmdResult<ProviderCont
         .ok_or_else(|| CommandError {
             code: "no_account".into(),
             message: format!("No account stored for {}", target.host),
+            ..Default::default()
         })?;
     let host_for_token = account.host.clone();
     let token = keyring_blocking(move |store| store.get(&host_for_token))
@@ -1161,6 +1582,7 @@ async fn provider_context(app: &AppHandle, path: &str) -> CmdResult<ProviderCont
         .ok_or_else(|| CommandError {
             code: "no_account".into(),
             message: format!("No token for {} found in the keychain", account.host),
+            ..Default::default()
         })?;
 
     let client = ProviderClient::new(account.kind, &account.host, &token, account.insecure_tls)?;
@@ -1199,6 +1621,7 @@ pub async fn create_change_request(
         return Err(CommandError {
             code: "invalid_title".into(),
             message: "Please enter a title".into(),
+            ..Default::default()
         });
     }
     let ctx = provider_context(&app, &path).await?;
@@ -1220,14 +1643,17 @@ fn pipeline_error(e: crate::pipeline::RunError) -> CommandError {
         crate::pipeline::RunError::Timeout => CommandError {
             code: "timeout".into(),
             message: "Pipeline run aborted: time limit reached".into(),
+            ..Default::default()
         },
         crate::pipeline::RunError::Rejected { code, message } => CommandError {
             code: code.into(),
             message,
+            ..Default::default()
         },
         crate::pipeline::RunError::Failed(message) => CommandError {
             code: "runner_failed".into(),
             message,
+            ..Default::default()
         },
     }
 }
@@ -1285,6 +1711,7 @@ pub async fn pipeline_graph(
             return Err(CommandError {
                 code: "runner_not_installed".into(),
                 message: "Pipeline runner is not installed".into(),
+                ..Default::default()
             });
         }
         crate::pipeline::load_graph(&PathBuf::from(path), &provider, &config)
@@ -1317,6 +1744,7 @@ pub async fn pipeline_run_scope(
             return Err(CommandError {
                 code: "runner_not_installed".into(),
                 message: "Pipeline runner is not installed".into(),
+                ..Default::default()
             });
         }
         // act ALWAYS needs Docker; gitlab-ci-local only for image: jobs (shell
@@ -1327,6 +1755,7 @@ pub async fn pipeline_run_scope(
             return Err(CommandError {
                 code: "docker_not_running".into(),
                 message: "Docker is not running".into(),
+                ..Default::default()
             });
         }
         // Host tools of the runner: gitlab-ci-local rsyncs the tracked files into
@@ -1338,6 +1767,7 @@ pub async fn pipeline_run_scope(
             return Err(CommandError {
                 code: "tools_missing".into(),
                 message: missing.join(", "),
+                ..Default::default()
             });
         }
         let state = app.state::<crate::pipeline::PipelineState>();
@@ -1540,6 +1970,7 @@ pub fn open_in_explorer(path: String) -> CmdResult<()> {
         return Err(CommandError {
             code: "invalid_path".into(),
             message: format!("Not a directory: {path}"),
+            ..Default::default()
         });
     }
     #[cfg(target_os = "windows")]
@@ -1618,6 +2049,7 @@ fn validate_editor_name(editor: &str) -> CmdResult<()> {
         return Err(CommandError {
             code: "invalid_editor".into(),
             message: format!("Invalid editor name: {editor}"),
+            ..Default::default()
         });
     }
     let lower = editor.to_ascii_lowercase();
@@ -1631,6 +2063,7 @@ fn validate_editor_name(editor: &str) -> CmdResult<()> {
         return Err(CommandError {
             code: "invalid_editor".into(),
             message: format!("“{editor}” is not allowed as an editor (interpreter)"),
+            ..Default::default()
         });
     }
     Ok(())
@@ -1651,6 +2084,7 @@ pub fn open_in_editor(path: String, editor: Option<String>) -> CmdResult<()> {
         return Err(CommandError {
             code: "invalid_path".into(),
             message: format!("Path does not exist: {path}"),
+            ..Default::default()
         });
     }
     let mut direct = Command::new(&editor);
@@ -1679,11 +2113,15 @@ pub fn open_terminal(path: String) -> CmdResult<()> {
     {
         // Windows Terminal preferred, otherwise the classic console. The path
         // NEVER goes through cmd parsing (injection): wt receives it as a real
-        // argument, the cmd console only as its working directory.
-        let mut wt = Command::new("wt");
-        wt.args(["-d", &path]);
-        if spawn_detached(wt).is_ok() {
-            return Ok(());
+        // argument, the cmd console only as its working directory. But wt
+        // splits its OWN command line at `;` (`x;calc` would open a tab
+        // running calc), so such a path goes straight to the console.
+        if !path.contains(';') {
+            let mut wt = Command::new("wt");
+            wt.args(["-d", &path]);
+            if spawn_detached(wt).is_ok() {
+                return Ok(());
+            }
         }
         use std::os::windows::process::CommandExt;
         let mut c = Command::new("cmd");
@@ -1786,14 +2224,32 @@ pub async fn unwatch_repository(state: tauri::State<'_, watcher::WatchState>) ->
 pub async fn git_fetch(
     app: AppHandle,
     path: String,
+    // A named remote, or every remote with `all`; neither =
+    // git's default remote as before.
+    remote: Option<String>,
+    all: Option<bool>,
+    // The automatic fetch: the app's own call, so no hooks run during it
+    // (tg_git_engine::repo_commands).
+    background: Option<bool>,
     on_progress: tauri::ipc::Channel<GitProgress>,
 ) -> CmdResult<String> {
     let token = app.state::<OpRegistry>().register(&path);
     let p = path.clone();
     let result = blocking(move || {
-        Git2Engine.fetch_with_progress(&PathBuf::from(p), &token, &mut |pr| {
+        let path = PathBuf::from(p);
+        let mut send = |pr| {
             let _ = on_progress.send(pr);
-        })
+        };
+        let mut fetch = || match (remote.as_deref(), all.unwrap_or(false)) {
+            (Some(r), _) => Git2Engine.fetch_from(&path, Some(r), &token, &mut send),
+            (None, true) => Git2Engine.fetch_from(&path, None, &token, &mut send),
+            (None, false) => Git2Engine.fetch_with_progress(&path, &token, &mut send),
+        };
+        if background.unwrap_or(false) {
+            tg_git_engine::repo_commands::on_its_own(fetch)
+        } else {
+            fetch()
+        }
     })
     .await;
     app.state::<OpRegistry>().unregister(&path);
@@ -1808,6 +2264,12 @@ pub async fn git_pull(
     // false instead of failing argument deserialization: default-off stays
     // behavior-neutral that way (Tauri v2 defaults missing Option args to None).
     prune: Option<bool>,
+    // "merge" | "rebase" | "ff-only"; None = whatever git is configured to do
+    // (a pull.rebase/pull.ff set in git always wins).
+    strategy: Option<String>,
+    // Pull from this remote + branch instead of the upstream.
+    remote: Option<String>,
+    branch: Option<String>,
     on_progress: tauri::ipc::Channel<GitProgress>,
 ) -> CmdResult<String> {
     // pull = fetch + merge/rebase -> writes index/workdir, hence under the lock.
@@ -1816,9 +2278,20 @@ pub async fn git_pull(
     let p = path.clone();
     let result = blocking(move || {
         with_index_lock(|| {
-            Git2Engine.pull_with_progress(&PathBuf::from(p), prune, &token, &mut |pr| {
-                let _ = on_progress.send(pr);
-            })
+            let from = match (remote.as_deref(), branch.as_deref()) {
+                (Some(r), Some(b)) => Some((r, b)),
+                _ => None,
+            };
+            Git2Engine.pull_with_strategy(
+                &PathBuf::from(p),
+                prune,
+                strategy.as_deref(),
+                from,
+                &token,
+                &mut |pr| {
+                    let _ = on_progress.send(pr);
+                },
+            )
         })
     })
     .await;
@@ -1915,6 +2388,7 @@ pub async fn ssh_remove_key(app: AppHandle, name: String) -> CmdResult<()> {
         return Err(CommandError {
             code: "cancelled".into(),
             message: "Deletion cancelled".into(),
+            ..Default::default()
         });
     }
     blocking(move || tg_git_engine::ssh::remove_key(&name)).await

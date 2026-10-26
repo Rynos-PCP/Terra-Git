@@ -53,9 +53,10 @@ fn status_args() -> [&'static str; 6] {
 
 /// Fetches the status via the system git and parses porcelain v2.
 /// `op_state` is supplied by the caller (it still comes from git2 — cheap and
-/// independent of the worktree scan).
+/// independent of the worktree scan). A refresh is the app's own call: no
+/// hooks, no foreign filter command (`repo_commands`).
 pub(crate) fn status_via_git(path: &Path) -> Result<PorcelainStatus> {
-    let raw = sidecar::run_git_raw(path, &status_args())?;
+    let raw = crate::repo_commands::on_its_own(|| sidecar::run_git_raw(path, &status_args()))?;
     Ok(parse_porcelain_v2(&raw))
 }
 

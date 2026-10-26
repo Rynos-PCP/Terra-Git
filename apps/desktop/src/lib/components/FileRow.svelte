@@ -3,11 +3,12 @@
   import { t, type MessageKey } from "../i18n.svelte";
   import {
     ignoreFile,
+    trackWithLfs,
+    openConflicts,
     openMergetool,
     resolveConflict,
     showBlame,
     stashPush,
-    ui,
   } from "../state.svelte";
   import { tooltip } from "../tooltip";
   import Icon from "./Icon.svelte";
@@ -125,7 +126,7 @@
         {disabled}
         onclick={(e) => {
           e.stopPropagation();
-          ui.modal = { kind: "conflictEditor", file: entry.path };
+          openConflicts(entry.path);
         }}
       >
         <Icon name="merge" size={12} />
@@ -214,6 +215,26 @@
           <button class="item ghost" role="menuitem" onclick={() => ignoreFile(`*.${ext}`)}>
             <Icon name="x" size={14} />
             {t("diff.ignoreExt", { ext })}
+          </button>
+        {/if}
+        <button
+          class="item ghost"
+          role="menuitem"
+          {disabled}
+          onclick={() => trackWithLfs(entry.path, entry.path)}
+        >
+          <Icon name="stash" size={14} />
+          {t("lfs.trackFile")}
+        </button>
+        {#if ext}
+          <button
+            class="item ghost"
+            role="menuitem"
+            {disabled}
+            onclick={() => trackWithLfs(`*.${ext}`, entry.path)}
+          >
+            <Icon name="stash" size={14} />
+            {t("lfs.trackExt", { ext })}
           </button>
         {/if}
       </Menu>

@@ -2,6 +2,7 @@
   import { api, type ConflictFile, type ConflictSegment } from "../api";
   import { t } from "../i18n.svelte";
   import { saveConflictResolution, showError, ui } from "../state.svelte";
+  import { sidePieces } from "../wordDiff";
 
   // Inline resolver of the conflict workshop: shows the segments of ONE file
   // with understandably labelled sides (props instead of ours/theirs) and saves
@@ -86,6 +87,15 @@
   }
 </script>
 
+{#snippet sideText(lines: string[], ref: string[] | null)}
+  {#if lines.length === 0}
+    <pre>{t("conflict.empty")}</pre>
+  {:else}
+    <pre>{#each sidePieces(lines, ref) as p, pi (pi)}{#if p.changed}<mark class="wd">{p.text}</mark
+          >{:else}{p.text}{/if}{/each}</pre>
+  {/if}
+{/snippet}
+
 <div class="resolver">
   {#if loadError}
     <p class="warn">{t("conflict.readFailed")}</p>
@@ -112,9 +122,11 @@
               {/if}
             </div>
             <div class="sides">
+              <!-- Word diff: what each side changed against the base, or
+                   against the other side when there is no base. -->
               <div class="side ours">
                 <header>{oursHead}</header>
-                <pre>{seg.ours.join("\n") || t("conflict.empty")}</pre>
+                {@render sideText(seg.ours, seg.base ?? seg.theirs)}
               </div>
               {#if seg.base}
                 <div class="side base">
@@ -124,7 +136,7 @@
               {/if}
               <div class="side theirs">
                 <header>{theirsHead}</header>
-                <pre>{seg.theirs.join("\n") || t("conflict.empty")}</pre>
+                {@render sideText(seg.theirs, seg.base ?? seg.ours)}
               </div>
             </div>
             <div class="choices">
@@ -277,6 +289,20 @@
   }
   .side.theirs header {
     color: var(--blue);
+  }
+
+  /* Word diff, in the colour of the side's header. */
+  .side mark.wd {
+    color: inherit;
+    border-radius: 2px;
+  }
+
+  .side.ours mark.wd {
+    background: color-mix(in srgb, var(--accent) 30%, transparent);
+  }
+
+  .side.theirs mark.wd {
+    background: color-mix(in srgb, var(--blue) 30%, transparent);
   }
 
   .side pre {

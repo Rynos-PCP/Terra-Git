@@ -29,7 +29,7 @@ vi.mock("./api", () => ({
 
 import { confirm } from "@tauri-apps/plugin-dialog";
 import { api } from "./api";
-import { gitPush, gitPushForce, ui } from "./state.svelte";
+import { gitPush, gitPushForce, resolvePushRejected, ui } from "./state.svelte";
 
 const mockedApi = vi.mocked(api);
 const mockedConfirm = vi.mocked(confirm);
@@ -98,17 +98,29 @@ describe("gitPushForce (explicit force push)", () => {
 });
 
 describe("gitPush non_fast_forward retry", () => {
-  it("the force retry hits the upstream remote and asks only ONCE", async () => {
+  it("offers the ways out in a dialog instead of a yes/no", async () => {
     mockedApi.push.mockRejectedValueOnce({
       code: "non_fast_forward",
       message: "remote is ahead",
     });
-    mockedConfirm.mockResolvedValueOnce(true);
 
     await gitPush();
 
-    // Exactly one question (the non_fast_forward path's, no duplicate).
-    expect(mockedConfirm).toHaveBeenCalledTimes(1);
+    expect(ui.modal).toEqual({ kind: "pushRejected", message: "remote is ahead" });
+    expect(mockedConfirm).not.toHaveBeenCalled();
+    expect(mockedApi.pushRemote).not.toHaveBeenCalled();
+  });
+
+  it("the force way out hits the upstream remote without a second question", async () => {
+    mockedApi.push.mockRejectedValueOnce({
+      code: "non_fast_forward",
+      message: "remote is ahead",
+    });
+    await gitPush();
+
+    await resolvePushRejected("force");
+
+    expect(mockedConfirm).not.toHaveBeenCalled();
     expect(mockedApi.pushRemote).toHaveBeenCalledTimes(1);
     expect(mockedApi.pushRemote).toHaveBeenCalledWith("/repo", "origin", true, expect.anything());
   });

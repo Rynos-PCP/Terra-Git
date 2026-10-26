@@ -73,6 +73,24 @@ export interface StashInfo {
   id: string;
 }
 
+/** Snapshot taken before a discard. */
+export interface DiscardedInfo {
+  /** Snapshot name (`<kind>-<unix>-<n>`). */
+  name: string;
+  /** `files`, `hunk`, or `overwrite` (taken before a forced restore). */
+  kind: string;
+  timestamp: number;
+  files: string[];
+  /** Bytes the snapshot occupies on disk. */
+  size: number;
+}
+
+/** Result of re-applying a stash. A pop drops the stash only without conflicts. */
+export interface StashApplyOutcome {
+  conflicted: string[];
+  dropped: boolean;
+}
+
 export interface TagInfo {
   name: string;
   targetId: string;
@@ -131,6 +149,10 @@ export interface ChangeRequestList {
 export interface GitProgress {
   phase: string;
   percent: number;
+  /** Item counter for list-based phases (staging): done so far … */
+  done?: number;
+  /** … out of this many. */
+  total?: number;
 }
 
 /** Creates a progress channel that forwards messages to `onProgress`. */
@@ -337,6 +359,14 @@ export interface DiffHunk {
   lines: DiffLine[];
 }
 
+/** Git LFS in a repository. */
+export interface LfsState {
+  used: boolean;
+  installed: boolean;
+  /** LFS files that are only pointers in the working directory. */
+  missing: number;
+}
+
 export interface FileDiff {
   path: string;
   oldPath: string | null;
@@ -347,6 +377,8 @@ export interface FileDiff {
   /** Byte size of the old/new version (mainly for binaries). */
   oldSize?: number;
   newSize?: number;
+  /** A Git LFS file: no hunks, the sizes are those of the real content. */
+  lfs?: boolean;
 }
 
 export type EolStyle = "lf" | "crlf" | "mixed" | "none";
@@ -393,9 +425,32 @@ export interface ScannedHost {
   knownHostsLines: string;
 }
 
+/** How a reset treats index and worktree. */
+export type ResetMode = "soft" | "mixed" | "hard";
+
+/** One reflog entry. */
+export interface ReflogEntry {
+  index: number;
+  id: string;
+  oldId: string;
+  action: string;
+  message: string;
+  time: number;
+  summary: string | null;
+}
+
+/** How a pull combines diverged histories. */
+export type PullStrategy = "merge" | "rebase" | "ff-only";
+/** What a pull is sent with: a strategy, the explicit "merge two unrelated
+ *  histories" after `unrelated_histories`, or an answer of the
+ *  diverged / push-rejected dialog ("-chosen": beats git's own pull settings). */
+export type PullMode = PullStrategy | "merge-unrelated" | "merge-chosen" | "rebase-chosen";
+
 export interface CommandError {
   code: string;
   message: string;
+  /** git's raw output behind the error, cleaned up and capped. */
+  detail?: string;
 }
 
 /** Normalizes arbitrary invoke errors onto CommandError. */
@@ -446,20 +501,88 @@ export const api = {
     channel.onmessage = onFile;
     return call<number>("get_commit_diff_stream", { path, commitId, maxFiles, onFile: channel });
   },
-  stage: (path: string, files: string[]) => call<void>("stage_files", { path, files }),
+  stage: (path: string, files: string[], onProgress?: (p: GitProgress) => void) =>
+    call<void>("stage_files", { path, files, onProgress: progressChannel(onProgress) }),
   unstage: (path: string, files: string[]) => call<void>("unstage_files", { path, files }),
-  discard: (path: string, files: string[]) => call<void>("discard_files", { path, files }),
-  commit: (path: string, message: string, amend: boolean) =>
-    call<string>("create_commit", { path, message, amend }),
+  discard: (
+    path: string,
+    files: string[],
+    limitBytes: number,
+    onProgress?: (p: GitProgress) => void,
+  ) =>
+    call<void>("discard_files", {
+      path,
+      files,
+      limitBytes,
+      onProgress: progressChannel(onProgress),
+    }),
+  listDiscarded: (path: string) => call<DiscardedInfo[]>("list_discarded", { path }),
+  restoreDiscarded: (path: string, name: string, limitBytes: number, force = false) =>
+    call<void>("restore_discarded", { path, name, force, limitBytes }),
+  deleteDiscarded: (path: string, name: string) => call<void>("delete_discarded", { path, name }),
+  commit: (path: string, message: string, amend: boolean, unsigned = false) =>
+    call<string>("create_commit", { path, message, amend, unsigned }),
   branches: (path: string) => call<BranchInfo[]>("list_branches", { path }),
   createBranch: (path: string, name: string, checkout: boolean) =>
     call<void>("create_branch", { path, name, checkout }),
   checkoutBranch: (path: string, name: string, onProgress?: (p: GitProgress) => void) =>
     call<void>("checkout_branch", { path, name, onProgress: progressChannel(onProgress) }),
-  fetch: (path: string, onProgress?: (p: GitProgress) => void) =>
-    call<string>("git_fetch", { path, onProgress: progressChannel(onProgress) }),
-  pull: (path: string, prune: boolean, onProgress?: (p: GitProgress) => void) =>
-    call<string>("git_pull", { path, prune, onProgress: progressChannel(onProgress) }),
+  fetch: (
+    path: string,
+    onProgress?: (p: GitProgress) => void,
+    target?: { remote?: string; all?: boolean; background?: boolean },
+  ) =>
+    call<string>("git_fetch", {
+      path,
+      remote: target?.remote ?? null,
+      all: target?.all ?? false,
+      // The automatic fetch: no hooks of the repository run during it.
+      background: target?.background ?? false,
+      onProgress: progressChannel(onProgress),
+    }),
+  lfsState: (path: string) => call<LfsState>("lfs_state", { path }),
+  lfsTrack: (path: string, pattern: string, file: string) =>
+    call<void>("lfs_track", { path, pattern, file }),
+  lfsPull: (path: string, onProgress?: (p: GitProgress) => void) =>
+    call<string>("lfs_pull", { path, onProgress: progressChannel(onProgress) }),
+  publishBranchOnly: (path: string, remote: string, onProgress?: (p: GitProgress) => void) =>
+    call<string>("publish_branch_only", { path, remote, onProgress: progressChannel(onProgress) }),
+  pull: (
+    path: string,
+    prune: boolean,
+    strategy?: PullMode,
+    onProgress?: (p: GitProgress) => void,
+    from?: { remote: string; branch: string },
+  ) =>
+    call<string>("git_pull", {
+      path,
+      prune,
+      strategy: strategy ?? null,
+      remote: from?.remote ?? null,
+      branch: from?.branch ?? null,
+      onProgress: progressChannel(onProgress),
+    }),
+  reflog: (path: string, reference: string, limit: number) =>
+    call<ReflogEntry[]>("get_reflog", { path, reference, limit }),
+  resetTo: (path: string, commit: string, mode: ResetMode, limitBytes: number) =>
+    call<string>("reset_to", { path, commit, mode, limitBytes }),
+  logRange: (path: string, from: string, to: string, limit: number) =>
+    call<CommitInfo[]>("log_range", { path, from, to, limit }),
+  rangeDiffStream: (
+    path: string,
+    from: string,
+    to: string,
+    maxFiles: number,
+    onFile: (fd: FileDiff) => void,
+  ) => {
+    const channel = new Channel<FileDiff>();
+    channel.onmessage = onFile;
+    return call<number>("get_range_diff_stream", { path, from, to, maxFiles, onFile: channel });
+  },
+  mergeBase: (path: string, a: string, b: string) => call<string>("merge_base", { path, a, b }),
+  countCommits: (path: string, from: string, to: string) =>
+    call<number>("count_commits", { path, from, to }),
+  defaultBranch: (path: string) => call<string | null>("default_branch", { path }),
   push: (path: string, onProgress?: (p: GitProgress) => void) =>
     call<string>("git_push", { path, onProgress: progressChannel(onProgress) }),
   /** Cancels the running remote operation (fetch/pull/push/clone). */
@@ -473,8 +596,9 @@ export const api = {
   stashList: (path: string) => call<StashInfo[]>("stash_list", { path }),
   stashPush: (path: string, message: string, files: string[]) =>
     call<string>("stash_push", { path, message, files }),
-  stashApply: (path: string, index: number) => call<void>("stash_apply", { path, index }),
-  stashPop: (path: string, index: number) => call<void>("stash_pop", { path, index }),
+  stashApply: (path: string, index: number) =>
+    call<StashApplyOutcome>("stash_apply", { path, index }),
+  stashPop: (path: string, index: number) => call<StashApplyOutcome>("stash_pop", { path, index }),
   stashDrop: (path: string, index: number) => call<void>("stash_drop", { path, index }),
 
   // Tags
@@ -488,7 +612,15 @@ export const api = {
     call<void>("rename_branch", { path, old, new: newName }),
   deleteBranch: (path: string, name: string, force: boolean) =>
     call<void>("delete_branch", { path, name, force }),
-  mergeBranch: (path: string, name: string) => call<string>("merge_branch", { path, name }),
+  mergeBranch: (path: string, name: string, allowUnrelated = false) =>
+    call<string>("merge_branch", { path, name, allowUnrelated }),
+  /** `lock`: the one git's message named (a submodule's, a worktree's). */
+  removeIndexLock: (path: string, lock?: string | null) =>
+    call<boolean>("remove_index_lock", { path, lock: lock ?? null }),
+  trustDirectory: (path: string) => call<void>("trust_directory", { path }),
+  unsetUpstream: (path: string) => call<void>("unset_upstream", { path }),
+  fetchUnshallow: (path: string, onProgress?: (p: GitProgress) => void) =>
+    call<string>("fetch_unshallow", { path, onProgress: progressChannel(onProgress) }),
   rebaseOnto: (path: string, name: string) => call<string>("rebase_onto", { path, name }),
 
   // Multi-step operations
@@ -499,6 +631,8 @@ export const api = {
     call<void>("resolve_conflict", { path, file, ours }),
   openMergetool: (path: string, file: string) => call<string>("open_mergetool", { path, file }),
   readConflict: (path: string, file: string) => call<ConflictFile>("read_conflict", { path, file }),
+  abandonConflicts: (path: string, files: string[], limitBytes: number) =>
+    call<string>("abandon_conflicts", { path, files, limitBytes }),
   saveResolution: (path: string, file: string, content: string) =>
     call<void>("save_resolution", { path, file, content }),
 
@@ -529,8 +663,8 @@ export const api = {
   // Hunk/line staging
   applyHunk: (path: string, file: string, hunkIndex: number, unstage: boolean) =>
     call<void>("apply_hunk", { path, file, hunkIndex, unstage }),
-  discardHunk: (path: string, file: string, hunkIndex: number) =>
-    call<void>("discard_hunk", { path, file, hunkIndex }),
+  discardHunk: (path: string, file: string, hunkIndex: number, limitBytes: number) =>
+    call<void>("discard_hunk", { path, file, hunkIndex, limitBytes }),
   applyLines: (
     path: string,
     file: string,

@@ -30,7 +30,7 @@
     </div>
     {#if conflicts > 0}
       <!-- With open conflicts the workshop is the primary route. -->
-      <button class="primary" onclick={openConflicts}>
+      <button class="primary" onclick={() => openConflicts()}>
         {t("conflictws.open")}
       </button>
     {/if}

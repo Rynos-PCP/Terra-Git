@@ -1,22 +1,27 @@
 <script lang="ts">
-  import { confirm } from "@tauri-apps/plugin-dialog";
+  import { confirm } from "../dialogs";
   import type { BranchInfo } from "../api";
-  import { t } from "../i18n.svelte";
+  import { t, tn } from "../i18n.svelte";
   import {
     createBranch,
     deleteBranch,
     mergeBranch,
+    openCompare,
     rebaseOnto,
+    rememberedUpdateSource,
     renameBranch,
     switchBranch,
     ui,
   } from "../state.svelte";
+  import { api } from "../api";
   import Icon from "./Icon.svelte";
   import Menu from "./Menu.svelte";
 
   let open = $state(false);
   let filter = $state("");
   let newName = $state("");
+  /** "Publish right away (branch only)" for the new branch. */
+  let publishNew = $state(false);
   /** Branch whose rename field is currently open. */
   let renaming = $state<string | null>(null);
   let renameValue = $state("");
@@ -54,7 +59,7 @@
     if (!name) return;
     close();
     newName = "";
-    createBranch(name);
+    createBranch(name, publishNew);
   }
 
   async function removeBranch(branch: BranchInfo) {
@@ -91,6 +96,27 @@
     close();
     await rebaseOnto(branch.name);
   }
+
+  function openUpdateFrom() {
+    close();
+    ui.modal = { kind: "updateFrom" };
+  }
+
+  // "n behind <source>": against the source last used to update this branch,
+  // counted when the menu opens.
+  let behind = $state<{ source: string; n: number } | null>(null);
+  $effect(() => {
+    const repo = ui.repo;
+    const source = open ? rememberedUpdateSource() : undefined;
+    if (!repo || !source) {
+      behind = null;
+      return;
+    }
+    api
+      .countCommits(repo.path, "HEAD", source)
+      .then((n) => (behind = { source, n }))
+      .catch(() => (behind = null));
+  });
 </script>
 
 <!-- No role="menu": this popup contains input fields and list entries,
@@ -98,7 +124,7 @@
      invalid and the arrow-key navigation would lead nowhere. -->
 <Menu bind:open width="360px" role="dialog" ariaLabel={t("branch.switch")}>
   {#snippet trigger({ toggle })}
-    <button class="segment" onclick={toggle} title={t("branch.switch")}>
+    <button class="segment" data-testid="branch-menu" onclick={toggle} title={t("branch.switch")}>
       <span class="glyph"><Icon name="branch" /></span>
       <span class="col">
         <span class="label">{t("branch.label")}</span>
@@ -108,11 +134,21 @@
     </button>
   {/snippet}
 
+  <div class="update">
+    <button class="ghost" onclick={openUpdateFrom} disabled={!ui.repo || ui.branches.length === 0}>
+      <Icon name="merge" size={13} />
+      {t("updateFrom.menu")}
+    </button>
+    {#if behind && behind.n > 0}
+      <span class="behind">{tn("updateFrom.behind", behind.n, { source: behind.source })}</span>
+    {/if}
+  </div>
+
   <input type="text" placeholder={t("branch.filterPlaceholder")} bind:value={filter} />
 
   <div class="list">
     {#each visible as b (b.name)}
-      <div class="row" class:head={b.isHead} class:gone={b.upstreamGone}>
+      <div class="row" data-branch={b.name} class:head={b.isHead} class:gone={b.upstreamGone}>
         {#if renaming === b.name}
           <input
             type="text"
@@ -144,10 +180,32 @@
               >
                 <Icon name="merge" size={13} />
               </button>
+              <button
+                class="ghost"
+                title={t("compare.withCurrent")}
+                onclick={() => {
+                  close();
+                  openCompare({
+                    from: "HEAD",
+                    to: b.name,
+                    fromLabel: currentBranch,
+                    toLabel: b.name,
+                    branch: b.name,
+                  });
+                }}
+              >
+                <Icon name="split" size={13} />
+              </button>
+              <!-- Rebase onto remote branches too (e.g. onto origin/main). -->
+              <button
+                class="ghost"
+                data-testid="rebase-onto"
+                title={t("branch.rebaseOnto")}
+                onclick={() => rebaseOn(b)}
+              >
+                <Icon name="history" size={13} />
+              </button>
               {#if !b.isRemote}
-                <button class="ghost" title={t("branch.rebaseOnto")} onclick={() => rebaseOn(b)}>
-                  <Icon name="history" size={13} />
-                </button>
                 <button class="ghost" title={t("branch.rename")} onclick={() => startRename(b)}>
                   <Icon name="edit" size={13} />
                 </button>
@@ -187,9 +245,37 @@
     <button class="primary" onclick={create} disabled={!newName.trim()}>{t("common.create")}</button
     >
   </div>
+  {#if ui.remotes.length > 0}
+    <label class="publish">
+      <input type="checkbox" bind:checked={publishNew} />
+      {t("branch.publishRightAway")}
+    </label>
+  {/if}
 </Menu>
 
 <style>
+  .publish {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-top: var(--space-1);
+    font-size: 12px;
+    color: var(--text-muted);
+    cursor: pointer;
+  }
+
+  .update {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    margin-bottom: var(--space-2);
+  }
+
+  .behind {
+    color: var(--text-muted);
+    font-size: 12px;
+  }
+
   .segment {
     background: transparent;
     border-color: transparent;

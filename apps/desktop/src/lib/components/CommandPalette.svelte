@@ -33,7 +33,7 @@
     /** Group for the intermediate headings. */
     group: string;
     icon: string;
-    run: () => void | Promise<void>;
+    run: () => unknown;
   }
 
   let open = $state(false);
@@ -61,6 +61,14 @@
             hint: "git fetch · Ctrl+Shift+F",
             icon: "refresh",
             run: gitFetch,
+          },
+          {
+            id: "updateFrom",
+            group: "sync",
+            label: t("updateFrom.menu"),
+            hint: "git merge / git rebase",
+            icon: "merge",
+            run: () => (ui.modal = { kind: "updateFrom" }),
           },
           {
             id: "pull",
@@ -125,7 +133,12 @@
       // Conflict workshop: only meaningful during a multi-step operation —
       // without one the view throws you straight back. The fixed slot in the
       // tools menu shows it always (greyed out there).
-      if (workshopAvailable(ui.status?.opState)) {
+      if (
+        workshopAvailable(
+          ui.status?.opState,
+          (ui.status?.unstaged ?? []).filter((e) => e.kind === "conflicted").length,
+        )
+      ) {
         cmds.push({
           id: "conflicts",
           group: "views",
@@ -134,6 +147,22 @@
           run: openConflicts,
         });
       }
+      cmds.push({
+        id: "compareBranches",
+        group: "tools",
+        label: t("compare.branchesMenu"),
+        hint: "git log A..B · git diff A...B",
+        icon: "split",
+        run: () => (ui.modal = { kind: "compareBranches" }),
+      });
+      cmds.push({
+        id: "reflog",
+        group: "tools",
+        label: t("reflog.menu"),
+        hint: "git reflog",
+        icon: "history",
+        run: () => (ui.modal = { kind: "reflog" }),
+      });
       cmds.push(
         {
           id: "tab-changes",

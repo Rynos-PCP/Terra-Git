@@ -1,8 +1,17 @@
 <script lang="ts">
   import { api, type OpContext } from "../api";
-  import { OP_LABELS, workshopCopy } from "../conflictWorkshop";
+  import { noOperationCopy, OP_LABELS, workshopCopy } from "../conflictWorkshop";
   import { t } from "../i18n.svelte";
-  import { abortOperation, continueOperation, refreshStatus, showError, ui } from "../state.svelte";
+  import {
+    abandonConflicts,
+    abortOperation,
+    continueOperation,
+    finishConflicts,
+    refreshStatus,
+    showError,
+    ui,
+  } from "../state.svelte";
+  import { tooltip } from "../tooltip";
   import ConflictResolver from "./ConflictResolver.svelte";
   import Icon from "./Icon.svelte";
 
@@ -26,7 +35,12 @@
   });
   const resolved = $derived(seen.filter((p) => !conflicted.includes(p)));
 
-  let selected = $state<string | null>(null);
+  // Conflicts without a running operation (a stash applied with conflicts):
+  // no continue/abort of git's — Done / Give up instead.
+  const noOperation = $derived(!ui.status || ui.status.opState === "clean");
+
+  // The "Resolve" button of a row opens the workshop on exactly that file.
+  let selected = $state<string | null>(ui.conflictFocus);
   $effect(() => {
     // Repair the selection: a resolved/vanished file -> the next open one.
     if (!selected || !conflicted.includes(selected)) selected = conflicted[0] ?? null;
@@ -45,12 +59,18 @@
       .catch(() => (ctx = null));
   });
 
-  // Operation finished (continued or aborted): back to the workspace.
+  // Nothing (left) to do here: an operation that ended (continued or aborted)
+  // without conflicts behind it, or a workshop opened on no conflict at all.
+  // Conflicts of a stash stay until Done/Give up — even once all are resolved.
   $effect(() => {
-    if (ui.status && ui.status.opState === "clean") ui.view = "repo";
+    if (!ui.status || ui.status.opState !== "clean") return;
+    if (conflicted.length === 0 && !ui.stashConflict && (seen.length === 0 || resolved.length > 0))
+      ui.view = "repo";
   });
 
-  const copy = $derived(workshopCopy(ctx));
+  const copy = $derived(
+    noOperation ? noOperationCopy(ui.stashConflict, ui.status?.branch ?? null) : workshopCopy(ctx),
+  );
   const oursHead = $derived(t(copy.ours.key, copy.ours.params));
   const theirsHead = $derived(t(copy.theirs.key, copy.theirs.params));
   const opLabel = $derived(OP_LABELS[ui.status?.opState ?? ""] ?? "");
@@ -113,10 +133,37 @@
     </div>
     <div class="head-actions">
       <button onclick={() => (ui.view = "repo")}>{t("conflictws.back")}</button>
-      <button class="abort" onclick={abortOperation}>{t("conflict.abort")}</button>
-      <button class="primary" disabled={conflicted.length > 0} onclick={continueOperation}>
-        {t("conflict.continue")}
-      </button>
+      {#if noOperation}
+        <button
+          class="abort"
+          data-testid="ws-abandon"
+          disabled={conflicted.length === 0}
+          onclick={abandonConflicts}
+          use:tooltip={t("conflictws.abandonHint")}
+        >
+          {t("conflictws.abandon")}
+        </button>
+        <button
+          class="primary"
+          data-testid="ws-finish"
+          disabled={conflicted.length > 0}
+          onclick={finishConflicts}
+        >
+          {t("conflictws.finish")}
+        </button>
+      {:else}
+        <button class="abort" data-testid="ws-abort" onclick={abortOperation}
+          >{t("conflict.abort")}</button
+        >
+        <button
+          class="primary"
+          data-testid="ws-continue"
+          disabled={conflicted.length > 0}
+          onclick={continueOperation}
+        >
+          {t("conflict.continue")}
+        </button>
+      {/if}
     </div>
   </header>
 
@@ -174,10 +221,18 @@
         <div class="file-head">
           <span class="path" title={selected}>{selected}</span>
           <div class="file-actions">
-            <button disabled={working} onclick={() => resolveWhole(true)}>
+            <button
+              data-testid="ws-take-ours"
+              disabled={working}
+              onclick={() => resolveWhole(true)}
+            >
               {t("conflictws.whole", { side: oursHead })}
             </button>
-            <button disabled={working} onclick={() => resolveWhole(false)}>
+            <button
+              data-testid="ws-take-theirs"
+              disabled={working}
+              onclick={() => resolveWhole(false)}
+            >
               {t("conflictws.whole", { side: theirsHead })}
             </button>
             <button disabled={working} onclick={openMergetool}>
@@ -193,8 +248,14 @@
         <div class="all-done">
           <Icon name="check" size={28} />
           <strong>{t("conflictws.allDone")}</strong>
-          <p>{t("conflictws.allDoneHint")}</p>
-          <button class="primary" onclick={continueOperation}>{t("conflict.continue")}</button>
+          {#if noOperation}
+            <!-- Conflicts of a stash or of no operation: nothing to continue. -->
+            <p>{t("conflictws.allDoneHintNoOp")}</p>
+            <button class="primary" onclick={finishConflicts}>{t("conflictws.finish")}</button>
+          {:else}
+            <p>{t("conflictws.allDoneHint")}</p>
+            <button class="primary" onclick={continueOperation}>{t("conflict.continue")}</button>
+          {/if}
         </div>
       {/if}
     </section>

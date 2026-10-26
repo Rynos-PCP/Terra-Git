@@ -69,6 +69,108 @@ fn expected_host_form(host: &str, port: Option<u16>) -> String {
     }
 }
 
+/// The ssh tools git itself uses. Git for Windows starts its own ssh (in
+/// `usr/bin` of the git installation), not the Windows one in System32 — a
+/// different version with different key exchanges, so the trust dialog has to
+/// ask the same program the fetch will run. Elsewhere: the one on PATH.
+fn ssh_tool(name: &'static str) -> String {
+    #[cfg(windows)]
+    {
+        static GIT_USR_BIN: std::sync::OnceLock<Option<PathBuf>> = std::sync::OnceLock::new();
+        let dir = GIT_USR_BIN.get_or_init(|| {
+            let out = Command::new("git").arg("--exec-path").output().ok()?;
+            let exec = PathBuf::from(String::from_utf8_lossy(&out.stdout).trim());
+            // <git>/mingw64/libexec/git-core → <git>/usr/bin
+            exec.ancestors()
+                .nth(3)
+                .map(|git| git.join("usr").join("bin"))
+                .filter(|d| d.join("ssh.exe").is_file())
+        });
+        if let Some(tool) = dir.as_ref().map(|d| d.join(format!("{name}.exe"))) {
+            if tool.is_file() {
+                return tool.to_string_lossy().into_owned();
+            }
+        }
+    }
+    name.to_string()
+}
+
+/// `ssh -G` output → (hostname, port, hostkeyalias).
+fn parse_ssh_config_dump(out: &str) -> (Option<String>, Option<u16>, Option<String>) {
+    let (mut hostname, mut port, mut alias) = (None, None, None);
+    for line in out.lines() {
+        let Some((key, value)) = line.trim().split_once(' ') else {
+            continue;
+        };
+        let value = value.trim();
+        match key {
+            "hostname" => hostname = Some(value.to_string()),
+            "port" => port = value.parse().ok(),
+            "hostkeyalias" if !value.eq_ignore_ascii_case("none") => {
+                alias = Some(value.to_string());
+            }
+            _ => {}
+        }
+    }
+    (hostname, port, alias)
+}
+
+/// The name ssh records `host` under in known_hosts: `HostKeyAlias` if set
+/// (without a port, as ssh does), else the `HostName` with `[…]:port` for a
+/// port other than 22.
+fn recorded_name(hostname: &str, port: u16, alias: Option<&str>) -> String {
+    match alias {
+        Some(a) => a.to_string(),
+        None if port == 22 => hostname.to_string(),
+        None => format!("[{hostname}]:{port}"),
+    }
+}
+
+/// Where ssh connects for `host` and the name it records the key under, after
+/// the user's ssh_config (`ssh -G`).
+struct Resolved {
+    /// The known_hosts name (see [`recorded_name`]).
+    name: String,
+    hostname: String,
+    /// `None` for ssh's default port.
+    port: Option<u16>,
+}
+
+/// How ssh itself names `host` in known_hosts, after the user's ssh_config
+/// (`ssh -G`). For `Host gh-work` → `HostName github.com` ssh records and looks
+/// up `github.com`; asking for `gh-work` never matched what it wrote, and the
+/// trust dialog could never save the key. Falls back to the plain form when
+/// `ssh -G` is unavailable.
+fn resolve_host(host: &str, port: Option<u16>) -> Resolved {
+    let plain = || Resolved {
+        name: expected_host_form(host, port),
+        hostname: host.to_string(),
+        port,
+    };
+    let mut args = vec!["-G".to_string()];
+    if let Some(p) = port {
+        args.extend(["-p".to_string(), p.to_string()]);
+    }
+    args.extend(["--".to_string(), host.to_string()]);
+    let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    let dump = run_capture(&ssh_tool("ssh"), &refs, None, Duration::from_secs(10))
+        .ok()
+        .filter(|(ok, _, _)| *ok)
+        .map(|(_, out, _)| parse_ssh_config_dump(&out));
+    let Some((Some(hostname), Some(p), alias)) = dump else {
+        return plain();
+    };
+    let name = recorded_name(&hostname, p, alias.as_deref());
+    if !valid_host(&hostname) || !valid_host(&name) {
+        return plain();
+    }
+    Resolved {
+        name,
+        hostname,
+        port: (p != 22).then_some(p),
+    }
+}
+
 /// Extracts the bare host from a known_hosts host form: `[host]:port` -> `host`,
 /// otherwise unchanged.
 fn bare_host_of(expected: &str) -> &str {
@@ -90,6 +192,19 @@ fn keyscan_args(host: &str, port: Option<u16>) -> Vec<String> {
     }
     args.push(host.to_string());
     args
+}
+
+/// known_hosts lines with their host field replaced by `name`; comments and
+/// empty lines dropped.
+fn rename_known_hosts_lines(lines: &str, name: &str) -> String {
+    lines
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .filter_map(|l| l.split_once(char::is_whitespace))
+        .map(|(_, rest)| format!("{name} {}", rest.trim_start()))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Binds the known_hosts lines supplied by the frontend to `expected_host` (the
@@ -235,20 +350,21 @@ fn run_capture(
     }
 
     // Drain the pipes in threads so the child process never blocks on a full
-    // pipe buffer while we wait for it.
+    // pipe buffer while we wait for it. Bounded: before any trust, a server
+    // decides what ssh prints (its banner, for one).
     let mut stdout_pipe = child.stdout.take();
     let mut stderr_pipe = child.stderr.take();
     let out_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(p) = stdout_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
+            buf = crate::sidecar::read_tail(p, 1024 * 1024);
         }
         buf
     });
     let err_reader = std::thread::spawn(move || {
         let mut buf = Vec::new();
         if let Some(p) = stderr_pipe.as_mut() {
-            let _ = p.read_to_end(&mut buf);
+            buf = crate::sidecar::read_tail(p, crate::sidecar::STDERR_KEEP);
         }
         buf
     });
@@ -439,23 +555,35 @@ pub fn scan_host(host: &str, port: Option<u16>) -> Result<ScannedHost> {
     if !valid_host(host) {
         return Err(ssh_err("invalid_host", "Invalid host name"));
     }
-    let expected = expected_host_form(host, port);
-    let args = keyscan_args(host, port);
+    let resolved = resolve_host(host, port);
+    let expected = resolved.name.clone();
+    // ssh-keyscan reads no ssh_config: it gets the host and port ssh resolved.
+    let args = keyscan_args(&resolved.hostname, resolved.port);
     let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
-    let (ok, stdout, _stderr) =
-        run_capture("ssh-keyscan", &arg_refs, None, Duration::from_secs(15))?;
-    let known_hosts_lines = stdout.trim().to_string();
-    if !ok || known_hosts_lines.is_empty() {
-        return Err(ssh_err(
-            "ssh_keyscan_failed",
-            "Could not retrieve host keys",
-        ));
-    }
+    // First ssh itself — the program git uses, so the key comes through the
+    // same key exchange the fetch will make. ssh-keyscan only as the fallback:
+    // the Windows build dies on "choose_kex: unsupported KEX method
+    // sntrup761x25519-sha512" against an OpenSSH 10 server and still takes
+    // its full timeout (user report).
+    let known_hosts_lines = match host_key_via_ssh(host, port) {
+        Ok(lines) => lines,
+        Err(_) => run_capture(
+            &ssh_tool("ssh-keyscan"),
+            &arg_refs,
+            None,
+            Duration::from_secs(15),
+        )
+        .ok()
+        .filter(|(ok, out, _)| *ok && !out.trim().is_empty())
+        // Named the way ssh records them (a HostKeyAlias, say).
+        .map(|(_, out, _)| rename_known_hosts_lines(out.trim(), &expected))
+        .ok_or_else(|| ssh_err("ssh_keyscan_failed", "Could not retrieve host keys"))?,
+    };
 
     // Fingerprints from the known_hosts lines (ssh-keygen -lf - reads stdin).
     let mut fingerprints = Vec::new();
     if let Ok((fp_ok, fp_out, _)) = run_capture(
-        "ssh-keygen",
+        &ssh_tool("ssh-keygen"),
         &["-lf", "-"],
         Some(&known_hosts_lines),
         Duration::from_secs(10),
@@ -471,7 +599,7 @@ pub fn scan_host(host: &str, port: Option<u16>) -> Result<ScannedHost> {
 
     // Does a known_hosts entry already exist for the host (known_hosts form)?
     let changed = run_capture(
-        "ssh-keygen",
+        &ssh_tool("ssh-keygen"),
         &["-F", &expected],
         None,
         Duration::from_secs(10),
@@ -487,13 +615,126 @@ pub fn scan_host(host: &str, port: Option<u16>) -> Result<ScannedHost> {
     })
 }
 
+/// Options for [`host_key_via_ssh`]: every authentication method off (the
+/// server is not trusted yet — it gets offered nothing), no prompt, the key
+/// recorded in plain text into `record` only, nothing read from the user's own
+/// known_hosts (`none` is an empty, never written file).
+fn probe_ssh_args(host: &str, port: Option<u16>, record: &Path, none: &Path) -> Vec<String> {
+    // Quoted: a user name with a space in the temp path would otherwise split
+    // the option into two file names.
+    let file = |p: &Path| format!("\"{}\"", p.to_string_lossy().replace('\\', "/"));
+    let mut args: Vec<String> = [
+        "BatchMode=yes",
+        "StrictHostKeyChecking=accept-new",
+        "HashKnownHosts=no",
+        "UpdateHostKeys=no",
+        "PubkeyAuthentication=no",
+        "PasswordAuthentication=no",
+        "KbdInteractiveAuthentication=no",
+        "GSSAPIAuthentication=no",
+        "HostbasedAuthentication=no",
+        // Record the key under the host name only: a `host,ip` line would not
+        // pass the host binding of trust_host.
+        "CheckHostIP=no",
+        // An untrusted server gets nothing forwarded.
+        "ForwardAgent=no",
+        "ClearAllForwardings=yes",
+        "ConnectTimeout=10",
+    ]
+    .iter()
+    .flat_map(|o| ["-o".to_string(), (*o).to_string()])
+    .collect();
+    args.extend([
+        "-o".to_string(),
+        format!("UserKnownHostsFile={}", file(record)),
+        "-o".to_string(),
+        format!("GlobalKnownHostsFile={}", file(none)),
+    ]);
+    if let Some(p) = port {
+        args.extend(["-p".to_string(), p.to_string()]);
+    }
+    args.extend(["--".to_string(), host.to_string(), "exit".to_string()]);
+    args
+}
+
+/// A fresh directory only this process owns. `create_dir` fails on anything
+/// that already exists — a directory planted in a shared `/tmp`, or a symlink
+/// to `~/.ssh` — and then the next name is tried; 0700 on Unix. The probe thus
+/// reads back only what its own ssh wrote.
+fn private_temp_dir(prefix: &str) -> std::io::Result<PathBuf> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    for _ in 0..16 {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let dir =
+            std::env::temp_dir().join(format!("{prefix}-{}-{nanos:x}-{n}", std::process::id()));
+        #[cfg(unix)]
+        let builder = {
+            use std::os::unix::fs::DirBuilderExt;
+            let mut b = std::fs::DirBuilder::new();
+            b.mode(0o700);
+            b
+        };
+        #[cfg(not(unix))]
+        let builder = std::fs::DirBuilder::new();
+        match builder.create(&dir) {
+            Ok(()) => return Ok(dir),
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "no free temporary directory",
+    ))
+}
+
+/// Reads at most `limit` bytes of a text file (lossy).
+fn read_bounded(path: &Path, limit: u64) -> std::io::Result<String> {
+    let mut buf = Vec::new();
+    std::fs::File::open(path)?
+        .take(limit)
+        .read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
+/// The host's key as ssh — the program git uses — sees it: a connection with
+/// all authentication off that is refused after the key exchange, the key
+/// recorded in a throw-away known_hosts file. Neither the user's known_hosts
+/// nor their keys are touched.
+fn host_key_via_ssh(host: &str, port: Option<u16>) -> Result<String> {
+    let dir = private_temp_dir("terra-git-hostkey")?;
+    let record = dir.join("known_hosts");
+    let args = probe_ssh_args(host, port, &record, &dir.join("none"));
+    let arg_refs: Vec<&str> = args.iter().map(String::as_str).collect();
+    // The refusal ("Permission denied") is expected — only the record counts.
+    let _ = run_capture(&ssh_tool("ssh"), &arg_refs, None, Duration::from_secs(20));
+    let lines = read_bounded(&record, 64 * 1024).unwrap_or_default();
+    let _ = std::fs::remove_dir_all(&dir);
+    let lines: Vec<&str> = lines
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .collect();
+    if lines.is_empty() {
+        return Err(ssh_err(
+            "ssh_keyscan_failed",
+            "Could not retrieve host keys",
+        ));
+    }
+    Ok(lines.join("\n"))
+}
+
 /// Adds `lines` to `~/.ssh/known_hosts` (TOFU). With `replace`, an existing
 /// entry for `host` is removed first (`ssh-keygen -R`).
 pub fn trust_host(host: &str, port: Option<u16>, lines: &str, replace: bool) -> Result<()> {
     if !valid_host(host) {
         return Err(ssh_err("invalid_host", "Invalid host name"));
     }
-    let expected = expected_host_form(host, port);
+    let expected = resolve_host(host, port).name;
     // Bind the lines to the host BEFORE any file/process effect: if validation
     // fails, known_hosts is neither created nor changed.
     let validated = validate_known_hosts_lines(lines, &expected)?;
@@ -501,7 +742,7 @@ pub fn trust_host(host: &str, port: Option<u16>, lines: &str, replace: bool) -> 
     if replace {
         // Remove the old entry; tolerate errors (there may be no entry).
         let _ = run_capture(
-            "ssh-keygen",
+            &ssh_tool("ssh-keygen"),
             &["-R", &expected],
             None,
             Duration::from_secs(10),
@@ -538,6 +779,25 @@ pub fn trust_host(host: &str, port: Option<u16>, lines: &str, replace: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_ssh_probe_offers_nothing_and_writes_only_its_own_file() {
+        let record = Path::new("C:/Users/Max Mustermann/AppData/Local/Temp/x/known_hosts");
+        let none = Path::new("C:/Users/Max Mustermann/AppData/Local/Temp/x/none");
+        let args = probe_ssh_args("192.0.2.12", Some(2222), record, none).join(" ");
+        for off in [
+            "PubkeyAuthentication=no",
+            "PasswordAuthentication=no",
+            "BatchMode=yes",
+        ] {
+            assert!(args.contains(off), "{args}");
+        }
+        // Quoted, so the space in the user name does not split the path.
+        assert!(args.contains(
+            "UserKnownHostsFile=\"C:/Users/Max Mustermann/AppData/Local/Temp/x/known_hosts\""
+        ));
+        assert!(args.ends_with("-p 2222 -- 192.0.2.12 exit"), "{args}");
+    }
 
     #[test]
     fn key_name_validation_blocks_traversal_and_options() {
@@ -663,6 +923,34 @@ mod tests {
             expected_host_form("2001:db8::1", Some(22)),
             "[2001:db8::1]:22"
         );
+    }
+
+    #[test]
+    fn the_known_hosts_name_follows_ssh_config() {
+        let dump = "user git\nhostname github.com\nport 2222\nhostkeyalias none\n";
+        let (h, p, a) = parse_ssh_config_dump(dump);
+        assert_eq!(
+            (h.as_deref(), p, a.as_deref()),
+            (Some("github.com"), Some(2222), None)
+        );
+        assert_eq!(recorded_name("github.com", 22, None), "github.com");
+        assert_eq!(recorded_name("github.com", 2222, None), "[github.com]:2222");
+        // HostKeyAlias: the alias, without a port — as ssh records it.
+        assert_eq!(recorded_name("10.1.2.3", 2222, Some("work")), "work");
+        assert_eq!(
+            rename_known_hosts_lines("# c\n10.1.2.3 ssh-ed25519 AAAA\n\n", "work"),
+            "work ssh-ed25519 AAAA"
+        );
+    }
+
+    #[test]
+    fn an_unconfigured_host_resolves_to_the_plain_form() {
+        // The explicit default port is no part of the name ssh records.
+        let r = resolve_host("terra-git-test.invalid", Some(22));
+        assert_eq!(r.name, "terra-git-test.invalid");
+        assert_eq!(r.port, None);
+        let r = resolve_host("terra-git-test.invalid", Some(2222));
+        assert_eq!(r.name, "[terra-git-test.invalid]:2222");
     }
 
     #[test]

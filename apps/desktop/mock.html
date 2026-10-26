@@ -15,10 +15,14 @@
       // Tauri IPC stub BEFORE all module imports: supplies demo data for the
       // headless UI smoke test (no real backend needed).
       window.__TAURI_INTERNALS__ = {
-        transformCallback: function () {
-          return Math.floor(Math.random() * 1e9);
+        // Callbacks are kept so the stubs can feed IPC channels (diff streams).
+        callbacks: {},
+        transformCallback: function (cb) {
+          var id = Math.floor(Math.random() * 1e9);
+          this.callbacks[id] = cb;
+          return id;
         },
-        invoke: function (cmd) {
+        invoke: function (cmd, args) {
           var scene = new URLSearchParams(location.search).get("scene");
           // Scene "conflictError": for conflict candidates showError refreshes
           // the status silently (state.svelte.ts) — without this stub the answer
@@ -84,11 +88,57 @@
                 subject: "Feature finished",
               },
             ],
+            list_discarded: [
+              {
+                name: "files-1783650000-0",
+                kind: "files",
+                timestamp: Math.floor(Date.now() / 1000) - 600,
+                files: ["src/lib/api.ts", "src/lib/state.svelte.ts", "README.md", "docs/notes.md"],
+                size: 48213760,
+              },
+              {
+                name: "hunk-1783640000-0",
+                kind: "hunk",
+                timestamp: Math.floor(Date.now() / 1000) - 7200,
+                files: ["crates/tg-git-engine/src/ops.rs"],
+                size: 131072,
+              },
+            ],
             list_remotes: [
               { name: "origin", url: "https://github.com/demo/terra-git.git" },
               { name: "gitlab", url: "https://gitlab.local/demo/terra-git.git" },
             ],
             provider_default_branch: "main",
+            default_branch: "origin/main",
+            count_commits: 7,
+            merge_base: "b0".repeat(20),
+            get_range_diff_stream: 0,
+            log_range: [
+              {
+                id: "c1".repeat(20),
+                shortId: "c1c1c1c1",
+                summary: "feat(sync): update branch from another one",
+                authorName: "Demo User",
+                authorEmail: "o@example.com",
+                time: Math.floor(Date.now() / 1000) - 3600,
+                parentIds: ["b0".repeat(20)],
+              },
+              {
+                id: "c2".repeat(20),
+                shortId: "c2c2c2c2",
+                summary: "fix(stash): keep the stash on conflicts",
+                authorName: "Demo User",
+                authorEmail: "o@example.com",
+                time: Math.floor(Date.now() / 1000) - 7200,
+                parentIds: ["c1".repeat(20)],
+              },
+            ],
+            get_reflog: [
+              { index: 0, id: "c1".repeat(20), oldId: "c2".repeat(20), action: "reset", message: "reset: moving to HEAD~1", time: Math.floor(Date.now() / 1000) - 300, summary: "feat(sync): update branch from another one" },
+              { index: 1, id: "c2".repeat(20), oldId: "c1".repeat(20), action: "commit", message: "commit: fix(stash): keep the stash on conflicts", time: Math.floor(Date.now() / 1000) - 3600, summary: "fix(stash): keep the stash on conflicts" },
+              { index: 2, id: "c1".repeat(20), oldId: "b0".repeat(20), action: "rebase", message: "rebase (finish): returning to refs/heads/main", time: Math.floor(Date.now() / 1000) - 7200, summary: "feat(sync): update branch from another one" },
+              { index: 3, id: "b0".repeat(20), oldId: "a9".repeat(20), action: "checkout", message: "checkout: moving from feature/palette to main", time: Math.floor(Date.now() / 1000) - 90000, summary: "chore: base" },
+            ],
             sparse_status: {
               enabled: true,
               patterns: ["apps", "crates"],
@@ -270,7 +320,7 @@
                 },
               ],
             },
-            "plugin:app|version": "1.0.0",
+            "plugin:app|version": "1.1.0",
             // Conflict workshop: a running merge (scene "conflicts").
             get_op_context: {
               kind: "merge",
@@ -333,6 +383,54 @@
                 res(data.peek_repo);
               }, 350);
             });
+          }
+          // Compare view (scene "compare"): two changed files through the
+          // channel, like the engine's stream.
+          if (cmd === "get_range_diff_stream" && args && args.onFile) {
+            var send = this.callbacks[args.onFile.id];
+            var ln = function (kind, o, n, content) {
+              return { kind: kind, oldLineno: o, newLineno: n, content: content };
+            };
+            var files = [
+              {
+                path: "src/lib/sync.ts",
+                oldPath: null,
+                isBinary: false,
+                truncated: false,
+                hunks: [
+                  {
+                    header: "@@ -12,5 +12,6 @@ export async function pull(",
+                    lines: [
+                      ln("context", 12, 12, "export async function pull(repo: Repo) {"),
+                      ln("deletion", 13, null, "  const strategy = repo.pullStrategy ?? \"merge\";"),
+                      ln("addition", null, 13, "  const strategy = repo.pullStrategy ?? \"rebase\";"),
+                      ln("addition", null, 14, "  await repo.fetch({ prune: true });"),
+                      ln("context", 14, 15, "  return run(repo, strategy);"),
+                      ln("context", 15, 16, "}"),
+                    ],
+                  },
+                ],
+              },
+              {
+                path: "README.md",
+                oldPath: null,
+                isBinary: false,
+                truncated: false,
+                hunks: [
+                  {
+                    header: "@@ -3,3 +3,3 @@",
+                    lines: [
+                      ln("context", 3, 3, "## Sync"),
+                      ln("deletion", 4, null, "Pull merges by default."),
+                      ln("addition", null, 4, "Pull rebases by default."),
+                      ln("context", 5, 5, ""),
+                    ],
+                  },
+                ],
+              },
+            ];
+            if (send) files.forEach(function (f, i) { send({ index: i, message: f }); });
+            return Promise.resolve(files.length);
           }
           return Promise.resolve(cmd in data ? data[cmd] : null);
         },

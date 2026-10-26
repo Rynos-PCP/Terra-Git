@@ -37,6 +37,14 @@ impl OpRegistry {
             .remove(&Self::key(path));
     }
 
+    /// Whether an operation is registered for `path` right now.
+    pub fn is_running(&self, path: &str) -> bool {
+        self.0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains_key(&Self::key(path))
+    }
+
     /// Cancels the running operation for `path`. `true` if one was running.
     pub fn cancel(&self, path: &str) -> bool {
         match self

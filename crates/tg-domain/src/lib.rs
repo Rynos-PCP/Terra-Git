@@ -269,6 +269,34 @@ pub struct StashInfo {
     pub id: String,
 }
 
+/// Result of re-applying a stash (apply or pop).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct StashApplyOutcome {
+    /// Files left in conflict, sorted. Empty = applied cleanly.
+    pub conflicted: Vec<String>,
+    /// Whether the stash was removed from the list. A pop drops it only when
+    /// nothing is in conflict; apply never drops.
+    pub dropped: bool,
+}
+
+/// A snapshot taken before a discard (`<git dir>/terra-git/discarded/<name>/`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DiscardedInfo {
+    /// Snapshot name (`<kind>-<unix>-<n>`), also its folder name.
+    pub name: String,
+    /// `files` (whole files), `hunk` (a single change block) or `overwrite`
+    /// (taken before a forced restore).
+    pub kind: String,
+    /// Unix seconds.
+    pub timestamp: i64,
+    /// Every path the discard touched.
+    pub files: Vec<String>,
+    /// Bytes the snapshot occupies on disk.
+    pub size: u64,
+}
+
 /// A tag.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -289,6 +317,17 @@ pub struct RemoteInfo {
     pub url: String,
 }
 
+/// Git LFS in a repository: whether it uses LFS, whether
+/// `git-lfs` is installed, and how many LFS files are only pointers in the
+/// working directory (their objects were not downloaded).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LfsState {
+    pub used: bool,
+    pub installed: bool,
+    pub missing: u32,
+}
+
 /// Progress of a remote operation (parsed from `git --progress` output).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -298,6 +337,13 @@ pub struct GitProgress {
     pub phase: String,
     /// Progress 0..=100 within the current phase.
     pub percent: u8,
+    /// Item counter for phases that work through a known list (e.g. staging
+    /// files): items done so far …
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub done: Option<u64>,
+    /// … out of this many.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total: Option<u64>,
 }
 
 /// Options for cloning (large-repo levers).
@@ -438,6 +484,30 @@ pub enum ResetMode {
     Soft,
     /// Also resets workdir/index (history rewrites; requires a clean tree).
     Hard,
+    /// Resets the index but keeps the workdir: the commits' changes become
+    /// unstaged changes.
+    Mixed,
+}
+
+/// One entry of a reflog: where a ref pointed, and why it moved.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReflogEntry {
+    /// Position in the reflog (0 = newest), as in `HEAD@{n}`.
+    pub index: usize,
+    /// The commit the ref pointed to after this step.
+    pub id: String,
+    /// The commit it pointed to before.
+    pub old_id: String,
+    /// The kind of step: `commit`, `checkout`, `reset`, `rebase`, `merge`,
+    /// `pull`, … (the part of git's message before the first colon).
+    pub action: String,
+    /// git's full message of the step.
+    pub message: String,
+    /// Unix seconds.
+    pub time: i64,
+    /// Subject of the commit `id`, if it still exists.
+    pub summary: Option<String>,
 }
 
 /// An executable undo/redo action (stored as inverses of each other).
@@ -466,6 +536,17 @@ pub enum UndoAction {
     /// Removes a stash by its commit id (redo of a stash drop).
     #[serde(rename_all = "camelCase")]
     DropStashByCommit { commit: String },
+    /// Takes the branch back to "no commit yet" (undo of the very first
+    /// commit): deletes the branch ref while HEAD keeps pointing at it; index
+    /// and worktree stay, so every file shows up as staged.
+    #[serde(rename_all = "camelCase")]
+    UncommitRoot { branch: String, commit: String },
+    /// Writes the state before a discard back (undo of a discard).
+    #[serde(rename_all = "camelCase")]
+    RestoreDiscarded { reference: String },
+    /// Discards again from the same snapshot (redo of a discard).
+    #[serde(rename_all = "camelCase")]
+    ReapplyDiscarded { reference: String },
 }
 
 /// Entry in the multi-step undo stack.
@@ -598,6 +679,10 @@ pub struct FileDiff {
     pub old_size: Option<u64>,
     #[serde(default)]
     pub new_size: Option<u64>,
+    /// A Git LFS file: no hunks — the pointer text would be
+    /// meaningless —, `old_size`/`new_size` are the sizes of the real content.
+    #[serde(default)]
+    pub lfs: bool,
 }
 
 /// One step of an interactive-rebase plan (order = order of application,

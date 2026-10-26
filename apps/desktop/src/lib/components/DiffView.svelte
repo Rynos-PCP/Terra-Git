@@ -1,10 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
-  import { confirm } from "@tauri-apps/plugin-dialog";
+  import { confirm } from "../dialogs";
   import type { DiffHunk, DiffLine, FileDiff, UnchangedInfo } from "../api";
   import { formatBytes } from "../format";
   import { highlightLine, langForFile } from "../highlight";
+  import { markHtml, pairedWordRanges, wordBudget, type Range } from "../wordDiff";
   import { t, tn } from "../i18n.svelte";
   import {
     applyHunk,
@@ -192,6 +193,24 @@
     return /\.(png|jpe?g|gif|webp|bmp|ico|svg)$/i.test(path);
   }
 
+  // ---- Word diff: what changed inside a changed line ----
+  // A block of deletions followed by additions pairs its n-th deletion with
+  // its n-th addition (as the split view lines them up); each pair gets the
+  // ranges that differ. Computed once per hunk, within one budget per shown
+  // diff: a huge or crafted one ends up without marks instead of freezing the
+  // window (a fresh budget for every other set of diffs).
+  const wordCache = new WeakMap<DiffHunk, Map<number, Range[]>>();
+  const budget = $derived({ ...wordBudget(), shown: diffs });
+
+  function wordRanges(hunk: DiffHunk): Map<number, Range[]> {
+    let ranges = wordCache.get(hunk);
+    if (!ranges) {
+      ranges = pairedWordRanges(hunk.lines, budget);
+      wordCache.set(hunk, ranges);
+    }
+    return ranges;
+  }
+
   // ---- Split view: arrange the lines of a hunk in pairs ----
   interface SplitRow {
     left: DiffLine | null;
@@ -353,11 +372,11 @@
   });
 </script>
 
-{#snippet codeCell(line: DiffLine, lang: string | null)}
+{#snippet codeCell(line: DiffLine, lang: string | null, words: Range[] | undefined)}
   <span class="sigil">{line.kind === "addition" ? "+" : line.kind === "deletion" ? "−" : " "}</span
-  ><!-- eslint-disable-next-line svelte/no-at-html-tags — highlightLine always escapes -->{@html highlightLine(
-    line.content,
-    lang,
+  ><!-- eslint-disable-next-line svelte/no-at-html-tags — highlightLine always escapes, markHtml only adds <mark> -->{@html markHtml(
+    highlightLine(line.content, lang),
+    words ?? [],
   )}
 {/snippet}
 
@@ -454,9 +473,9 @@
                 {/if}
               </div>
             </div>
-          {:else if file.isBinary}
+          {:else if file.isBinary || file.lfs}
             <div class="note">
-              <p>{t("diff.binaryNote")}</p>
+              <p>{file.lfs ? t("diff.lfsNote") : t("diff.binaryNote")}</p>
               {#if file.oldSize != null && file.newSize != null}
                 <!-- Changed: both sides present -> old → new (Δ) -->
                 <p class="binary-size">
@@ -560,7 +579,11 @@
                                   : ''
                                 : 'void'}"
                             >
-                              {#if row.left}{@render codeCell(row.left, lang)}{/if}
+                              {#if row.left}{@render codeCell(
+                                  row.left,
+                                  lang,
+                                  wordRanges(hunk).get(row.leftIdx),
+                                )}{/if}
                             </td>
                             <td class="ln">{row.right?.newLineno ?? ""}</td>
                             <td
@@ -570,7 +593,11 @@
                                   : ''
                                 : 'void'}"
                             >
-                              {#if row.right}{@render codeCell(row.right, lang)}{/if}
+                              {#if row.right}{@render codeCell(
+                                  row.right,
+                                  lang,
+                                  wordRanges(hunk).get(row.rightIdx),
+                                )}{/if}
                             </td>
                           </tr>
                         {/each}
@@ -599,7 +626,9 @@
                             <td class="ln" onclick={() => toggleLine(hi, li, line)}
                               >{line.newLineno ?? ""}</td
                             >
-                            <td class="code">{@render codeCell(line, lang)}</td>
+                            <td class="code"
+                              >{@render codeCell(line, lang, wordRanges(hunk).get(li))}</td
+                            >
                           </tr>
                         {/each}
                       </tbody>
@@ -858,6 +887,21 @@
   tr.deletion .code,
   .code.deletion {
     background: var(--del-bg);
+  }
+
+  /* Word diff: the changed part of a changed line, stronger. */
+  tr.addition .code :global(mark.wd),
+  .code.addition :global(mark.wd) {
+    background: var(--add-bg-strong);
+    color: inherit;
+    border-radius: 2px;
+  }
+
+  tr.deletion .code :global(mark.wd),
+  .code.deletion :global(mark.wd) {
+    background: var(--del-bg-strong);
+    color: inherit;
+    border-radius: 2px;
   }
 
   tr.addition .sigil {

@@ -19,11 +19,13 @@
   } from "./lib/state.svelte";
   import { nextTab } from "./lib/tabNav";
   import BisectBanner from "./lib/components/BisectBanner.svelte";
+  import LfsBanner from "./lib/components/LfsBanner.svelte";
   import ChangesPanel from "./lib/components/ChangesPanel.svelte";
   import CloneView from "./lib/components/CloneView.svelte";
   import CommandPalette from "./lib/components/CommandPalette.svelte";
   import CommitsWorkshopView from "./lib/components/CommitsWorkshopView.svelte";
   import ConflictBanner from "./lib/components/ConflictBanner.svelte";
+  import CompareView from "./lib/components/CompareView.svelte";
   import ConflictsWorkshopView from "./lib/components/ConflictsWorkshopView.svelte";
   import EditMenu from "./lib/components/EditMenu.svelte";
   import HistoryPanel from "./lib/components/HistoryPanel.svelte";
@@ -273,11 +275,16 @@
     <Toolbar />
     <CloneView />
     <PipelineView />
+  {:else if ui.view === "compare"}
+    <Toolbar />
+    <CloneView />
+    <CompareView />
   {:else}
     <Toolbar />
     <CloneView />
     <ConflictBanner />
     <BisectBanner />
+    <LfsBanner />
     <div
       class="tabs"
       role="tablist"

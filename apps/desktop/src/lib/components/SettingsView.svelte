@@ -15,6 +15,7 @@
     showInfo,
     ui,
   } from "../state.svelte";
+  import { formatBytes } from "../format";
   import Icon from "./Icon.svelte";
 
   // The app version, shown at the end of the App section. SECURITY.md and the
@@ -236,6 +237,24 @@
           <option value={0}>{t("settings.toastOff")}</option>
         </select>
       </label>
+      <label>
+        <span class="lbl">{t("settings.pullStrategy")}</span>
+        <select bind:value={ui.pullStrategy} onchange={savePrefs}>
+          <option value="merge">{t("settings.pullMerge")}</option>
+          <option value="rebase">{t("settings.pullRebase")}</option>
+          <option value="ff-only">{t("settings.pullAsk")}</option>
+        </select>
+      </label>
+      <p class="hint-text">{t("settings.pullStrategyHint")}</p>
+      <label>
+        <span class="lbl">{t("settings.discardLimit")}</span>
+        <select bind:value={ui.discardLimitMb} onchange={savePrefs}>
+          {#each [100, 250, 500, 1024, 2048, 5120] as mb (mb)}
+            <option value={mb}>{formatBytes(mb * 1024 * 1024)}</option>
+          {/each}
+        </select>
+      </label>
+      <p class="hint-text">{t("settings.discardLimitHint")}</p>
       {#if appVersion}
         <p class="hint-text">{t("settings.version", { version: appVersion })}</p>
       {/if}

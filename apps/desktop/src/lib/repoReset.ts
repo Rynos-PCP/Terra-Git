@@ -45,6 +45,10 @@ export interface RepoSlices {
   bisect: { stepsLeft: number | null; firstBad: string | null };
   modal: unknown;
   errorAction: unknown;
+  stashConflict: unknown;
+  conflictFocus: string | null;
+  compare: unknown;
+  lfs: unknown;
 }
 
 /**
@@ -96,6 +100,13 @@ export function resetRepoSlices(ui: RepoSlices): void {
   // CURRENT repo — in the next repo it would be misleading (the message itself
   // may stay, see the doc above).
   ui.errorAction = null;
+  // The stash conflicts and the workshop focus belong to the old repo.
+  ui.stashConflict = null;
+  ui.conflictFocus = null;
+  ui.compare = null;
+  ui.lfs = null;
+  // The compare view shows two commits of the old repo.
+  if (ui.view === "compare") ui.view = "repo";
   // The pipeline cockpit belongs to the old repo: initialize the slice and close
   // an open pipeline view. The view semantics stay in ONE place
   // (pipelineModel.ts).

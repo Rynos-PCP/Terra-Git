@@ -21,16 +21,24 @@ async function req(method, path, body) {
 }
 
 /** Starts tauri-driver (which talks to msedgedriver itself) and a session. */
-export async function startSession({ application, driverBin, nativeDriver }) {
+const driverUp = () =>
+  fetch(`http://127.0.0.1:${PORT}/status`)
+    .then((r) => r.ok)
+    .catch(() => false);
+
+export async function startSession({ application, driverBin, nativeDriver, env }) {
+  // A driver from the previous test file may still be shutting down: wait
+  // until the port is free, or the new driver cannot bind it.
+  for (let i = 0; i < 50 && (await driverUp()); i++) await sleep(200);
+  // `env` reaches the app: tauri-driver and msedgedriver pass it on.
   const driver = spawn(driverBin, ["--native-driver", nativeDriver], {
     stdio: "ignore",
+    env: { ...process.env, ...env },
   });
   // Wait until the driver port answers.
   let up = false;
-  for (let i = 0; i < 50 && !up; i++) {
-    up = await fetch(`http://127.0.0.1:${PORT}/status`)
-      .then((r) => r.ok)
-      .catch(() => false);
+  for (let i = 0; i < 150 && !up; i++) {
+    up = await driverUp();
     if (!up) await sleep(200);
   }
   if (!up) {
@@ -53,7 +61,10 @@ export async function startSession({ application, driverBin, nativeDriver }) {
       // Give msedgedriver time to end the app — otherwise a locked tg-app.exe
       // stays behind (next build: os error 5).
       await sleep(500);
+      // Wait for the driver to be gone, so the next session can bind the port.
+      const exited = new Promise((r) => driver.once("exit", r));
       driver.kill();
+      await Promise.race([exited, sleep(5000)]);
     },
     /** Runs a script in the WebView; the `return` value comes back. */
     async exec(script, args = []) {

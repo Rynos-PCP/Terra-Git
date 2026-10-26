@@ -2,8 +2,9 @@
 # Generate with: `cargo about generate about.hbs > THIRD-PARTY-NOTICES.txt`.
 #
 # This covers the RUST dependency graph only. The installer also ships the built
-# frontend, so the npm half is appended separately by
-# `node scripts/gen-npm-notices.mjs` — see CONTRIBUTING.md.
+# frontend and C libraries compiled in from vendored sources, so two more parts
+# are appended: `node scripts/gen-npm-notices.mjs` and
+# `node scripts/gen-vendored-notices.mjs` — see CONTRIBUTING.md.
 
 # Allowed licenses (kept in sync with deny.toml). libgit2-sys: GPL-2.0 with a
 # linking exception.
