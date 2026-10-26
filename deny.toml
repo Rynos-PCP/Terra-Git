@@ -3,31 +3,20 @@
 
 [advisories]
 # RUSTSEC advisory DB. Known, deliberately accepted advisories in `ignore`
-# (triaged 2026-07-15). Exclusively transitive items without an available fix —
-# re-evaluate regularly. The git2 entries were dropped with git2 0.21; the
-# remaining ones wait on Tauri's GTK4 migration.
+# (triaged 2026-10-26). Exclusively transitive items without an available fix —
+# re-evaluate regularly. The gtk-rs "unmaintained" entries were withdrawn
+# upstream (2026-08), the unic-* crates left the tree with the 1.1 updates.
 yanked = "warn"
+# Unsound advisories count for transitive crates too (the default only looks
+# at direct dependencies) — accepted ones are listed below with a reason.
+unsound = "all"
 ignore = [
-    # gtk-rs GTK3 bindings "unmaintained" — comes in through Tauri 2 / WebKitGTK
-    # (Linux only). No fix until Tauri's GTK4 migration; not a vulnerability.
-    "RUSTSEC-2024-0411",
-    "RUSTSEC-2024-0412",
-    "RUSTSEC-2024-0413",
-    "RUSTSEC-2024-0414",
-    "RUSTSEC-2024-0415",
-    "RUSTSEC-2024-0416",
-    "RUSTSEC-2024-0417",
-    "RUSTSEC-2024-0418",
-    "RUSTSEC-2024-0419",
-    "RUSTSEC-2024-0420",
     # proc-macro-error "unmaintained" — a transitive macro dependency.
     "RUSTSEC-2024-0370",
-    # unic-* "unmaintained" — transitive (Unicode/idna). Not a vulnerability.
-    "RUSTSEC-2025-0075",
-    "RUSTSEC-2025-0080",
-    "RUSTSEC-2025-0081",
-    "RUSTSEC-2025-0098",
-    "RUSTSEC-2025-0100",
+    # glib 0.18 `VariantStrIter` unsound (GHSA-wrw7-89jp-8q8g) — comes in through
+    # Tauri 2 / WebKitGTK (Linux only), fixed in glib 0.20, which needs Tauri's
+    # GTK4 migration. No crate in the tree calls `VariantStrIter`.
+    "RUSTSEC-2024-0429",
 ]
 
 [licenses]
