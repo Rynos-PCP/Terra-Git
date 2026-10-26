@@ -2925,8 +2925,9 @@ impl Git2Engine {
         let mut wanted: Vec<String> = files.to_vec();
         wanted.extend(files.iter().filter_map(|f| renames.get(f).cloned()));
         // A file standing where a restored path needs its folder (`d` instead
-        // of `d/a`) is removed by the checkout — it belongs into the copy too.
-        wanted.extend(discarded::blocking_ancestors(&workdir, &wanted));
+        // of `d/a`) has to go — it belongs into the copy too.
+        let blocking = discarded::blocking_ancestors(&workdir, &wanted);
+        wanted.extend(blocking.iter().cloned());
         let paths = discarded::expand_paths(&workdir, &wanted)?;
         discarded::remove_broken(&repo);
         discarded::ensure_room(
@@ -2958,6 +2959,13 @@ impl Git2Engine {
             discarded::begin_reporting(&repo, &workdir, "files", &paths, Some(cancel), &mut |d| {
                 progress("backup", d)
             })?;
+        // The copy holds them now. libgit2 replaces such a file by the folder
+        // only with `core.ignorecase` (Windows, macOS); a case-sensitive repo
+        // (Linux) fails with "failed to make directory … directory exists" —
+        // removed here, the checkout behaves the same everywhere.
+        for file in &blocking {
+            std::fs::remove_file(discarded::check_path(&workdir, file)?)?;
+        }
         self.discard(path, files)?;
         discarded::finish_reporting(&repo, &workdir, &name, &mut |d| progress("discarding", d))?;
         Ok(name)

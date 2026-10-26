@@ -4203,11 +4203,18 @@ fn restoring_a_backup_refuses_to_overwrite_untracked_files() {
     assert_eq!(read(&path, "notes.txt").as_deref(), Some("my edit\n"));
 }
 
-/// Discarding `d/a` where a file `d` took the folder's place: the checkout
-/// removes that file, so the copy keeps it — and restoring brings it back.
+/// Discarding `d/a` where a file `d` took the folder's place: the file has to
+/// go, so the copy keeps it — and restoring brings it back. Case-sensitive like
+/// on Linux, where libgit2 does not remove the file itself.
 #[test]
 fn discard_keeps_a_copy_of_a_file_that_took_a_folders_place() {
     let (_g, path) = init_repo();
+    git2::Repository::open(&path)
+        .unwrap()
+        .config()
+        .unwrap()
+        .set_bool("core.ignorecase", false)
+        .unwrap();
     let engine = Git2Engine;
     write(&path, "d/a", "a\n");
     write(&path, "d/b", "b\n");
